@@ -74,17 +74,37 @@ func (w *Worker) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
+// Implement job dispatch and outcome routing.
 func (w *Worker) handleOne(ctx context.Context, job Job) error {
-	// TODO: Implement job dispatch and outcome routing.
 	// 1. Look up the handler by job.Task; return ErrUnknownTask if not registered.
+	handl, ok := w.handlers[job.Task]
+	if !ok {
+		return ErrUnknownTask
+	}
 	// 2. Record JobStarted metric, then call the handler.
+	w.metrics.JobStarted(ctx, job)
+	jobRes := handl(ctx, job)
 	// 3. On success (result.Err == nil): Ack the job and record JobCompleted.
-	// 4. On any failure: record JobFailed(retryable).
-	//    a. If the failure is permanent (!result.Retryable) or the job is exhausted
-	//       (ShouldDeadLetter): call DeadLetter and record JobDeadLettered.
-	//    b. Otherwise: compute nextRunAt via RetryPolicy.NextDelay(job.Attempt+1),
-	//       call Retry, and record JobRetried.
-	return nil
+	if jobRes.Err == nil {
+		if err := w.backend.Ack(ctx, job.ID); err != nil {
+			return err
+		}
+		w.metrics.JobCompleted(ctx, job)
+		return nil
+	}
+
+	// handler failed
+	w.metrics.JobFailed(ctx, job, jobRes.Retryable)
+	if !jobRes.Retryable || ShouldDeadLetter(job) {
+		err := w.backend.DeadLetter(ctx, job, jobRes.Err.Error())
+		w.metrics.JobDeadLettered(ctx, job)
+		return err
+	} else {
+		nextRunAt := time.Now().UTC().Add(w.config.RetryPolicy.NextDelay(job.Attempt + 1))
+		err := w.backend.Retry(ctx, job, nextRunAt)
+		w.metrics.JobRetried(ctx, job)
+		return err
+	}
 }
 
 func waitAll(wg *sync.WaitGroup, done chan<- struct{}) {
