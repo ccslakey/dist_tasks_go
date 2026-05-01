@@ -36,13 +36,14 @@ enqueue-demo / application code
 - [x] Go module scaffold
 - [x] Queue and worker types
 - [x] Redis Streams backend shape
-- [x] Retry policy helper
 - [x] Example task handlers
 - [x] Demo commands
 - [x] Tests that document expected behavior
-- [ ] Redis `XADD` enqueue
-- [ ] Redis consumer group claim/dequeue
-- [ ] Redis `XACK` success path
+- [x] Redis `XADD` enqueue
+- [x] Redis consumer group claim/dequeue
+- [x] Redis `XACK` success path
+- [x] `RetryPolicy.NextDelay` exponential backoff
+- [ ] `Worker.handleOne` dispatch and outcome routing
 - [ ] Retry scheduling and promotion
 - [ ] Dead-letter movement
 - [ ] Visibility timeout recovery with `XAUTOCLAIM`
@@ -64,7 +65,7 @@ Run tests:
 go test ./...
 ```
 
-The demo commands compile, but they will return `not implemented` until the Redis backend TODOs are filled in:
+The enqueue demo works end-to-end. The worker demo will run but handlers won't be dispatched until `Worker.Run` and `Worker.handleOne` are implemented:
 
 ```sh
 go run ./cmd/enqueue-demo
@@ -73,16 +74,18 @@ go run ./cmd/worker-demo
 
 ## Implementation Path
 
-1. Implement `redisstream.Backend.Enqueue` with `XADD`.
-2. Create or ensure the Redis consumer group during backend initialization.
-3. Implement `Claim` using `XREADGROUP`.
-4. Implement `Ack` using `XACK`.
-5. Implement retry scheduling with a Redis sorted set keyed by next-run timestamp.
-6. Promote due retries back into the main stream.
-7. Implement `DeadLetter` with a separate stream that stores the original job and failure reason.
-8. Implement lease recovery with `XAUTOCLAIM` or `XPENDING` plus `XCLAIM`.
-9. Replace `Worker.Run` with a real bounded goroutine worker loop.
-10. Add a Prometheus-backed `queue.Metrics` implementation.
+1. ~~Implement `redisstream.Backend.Enqueue` with `XADD`.~~
+2. ~~Create or ensure the Redis consumer group during backend initialization.~~
+3. ~~Implement `Claim` using `XREADGROUP`.~~
+4. ~~Implement `Ack` using `XACK`.~~
+5. Implement `RetryPolicy.NextDelay` with exponential backoff (`queue/retry.go`).
+6. Implement `Worker.handleOne` dispatch and outcome routing (`queue/worker.go`).
+7. Implement retry scheduling with a Redis sorted set keyed by next-run timestamp.
+8. Promote due retries back into the main stream (fill in `promoteRetriesScript` in `redisstream/scripts.go`).
+9. Implement `DeadLetter` with a separate stream that stores the original job and failure reason.
+10. Implement lease recovery with `XAUTOCLAIM` or `XPENDING` plus `XCLAIM`.
+11. Replace `Worker.Run` with a real bounded goroutine worker loop.
+12. Add a Prometheus-backed `queue.Metrics` implementation.
 
 ## Failure Semantics To Understand
 
