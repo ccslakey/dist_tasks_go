@@ -8,14 +8,14 @@ import (
 type JobID string
 
 type Job struct {
-	ID          JobID           `json:"id"`
-	Task        string          `json:"task"`
-	Payload     json.RawMessage `json:"payload"`
-	Attempt     int             `json:"attempt"`
-	MaxAttempts int             `json:"max_attempts"`
+	ID          JobID           `json:"id"`           // stream entry ID assigned by Redis on XADD
+	Task        string          `json:"task"`         // stored/retrieved as a plain string field
+	Payload     json.RawMessage `json:"payload"`      // stored as string(payload); cast back with json.RawMessage(s)
+	Attempt     int             `json:"attempt"`      // stored as a decimal string; parse with strconv.Atoi
+	MaxAttempts int             `json:"max_attempts"` // stored as a decimal string; parse with strconv.Atoi
 	TraceID     string          `json:"trace_id,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
-	AvailableAt time.Time       `json:"available_at"`
+	CreatedAt   time.Time       `json:"created_at"`   // store/parse as time.RFC3339Nano
+	AvailableAt time.Time       `json:"available_at"` // store/parse as time.RFC3339Nano
 }
 
 type EnqueueOptions struct {

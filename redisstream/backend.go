@@ -2,9 +2,14 @@ package redisstream
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"strconv"
 	"time"
 
 	"dist_tasks_go/queue"
+
+	"github.com/redis/go-redis/v9"
 )
 
 type Config struct {
@@ -17,6 +22,7 @@ type Config struct {
 
 type Backend struct {
 	config Config
+	rds    *redis.Client
 }
 
 func New(config Config) (*Backend, error) {
@@ -35,24 +41,106 @@ func New(config Config) (*Backend, error) {
 	if config.DeadLetter == "" {
 		config.DeadLetter = "dtq:dead"
 	}
-	return &Backend{config: config}, nil
+	rdsCli := redis.NewClient(&redis.Options{
+		Addr:     config.Addr,
+		Password: "", // no password
+		DB:       0,  // use default DB
+		Protocol: 2,
+	})
+
+	_, err := rdsCli.XGroupCreateMkStream(context.Background(), config.Stream, config.Group, "$").Result()
+	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+		return nil, err
+	}
+
+	return &Backend{config: config, rds: rdsCli}, nil
 }
 
 func (b *Backend) Enqueue(ctx context.Context, job queue.Job) (queue.JobID, error) {
-	// TODO: Use Redis XADD against b.config.Stream.
-	// Store task, payload, attempt, max attempts, timestamps, and trace id as fields.
-	return "", queue.ErrNotImplemented
+	// Use Redis XADD against b.config.Stream.
+	// Store task, payload, attempt, max attempts,
+	// timestamps, and trace id as fields.
+	args := redis.XAddArgs{
+		Stream: b.config.Stream,
+		Values: map[string]interface{}{
+			"Task":        job.Task,
+			"Payload":     string(job.Payload),
+			"Attempt":     job.Attempt,
+			"MaxAttempts": job.MaxAttempts,
+			"TraceID":     job.TraceID,
+			"CreatedAt":   job.CreatedAt.Format(time.RFC3339Nano),
+			"AvailableAt": job.AvailableAt.Format(time.RFC3339Nano),
+		},
+	}
+	val, err := b.rds.XAdd(ctx, &args).Result()
+
+	return queue.JobID(val), err
+
 }
 
 func (b *Backend) Claim(ctx context.Context, workerID string, limit int) ([]queue.Job, error) {
 	// TODO: Use XREADGROUP to claim new jobs for workerID.
+
+	args := redis.XReadGroupArgs{
+		Group:    b.config.Group,
+		Consumer: workerID,
+		Count:    int64(limit),
+		Streams:  []string{b.config.Stream, ">"},
+	}
+
+	streams, xrErr := b.rds.XReadGroup(ctx, &args).Result()
+
+	if xrErr != nil {
+		return nil, fmt.Errorf("err in xreadgroup. workerId:err %s: %w", workerID, xrErr)
+	}
+
 	// Later, combine this with retry promotion so delayed retries re-enter the stream.
-	return nil, queue.ErrNotImplemented
+	var jobs []queue.Job
+
+	for _, s := range streams {
+
+		for _, messageJob := range s.Messages {
+			jobVals := messageJob.Values
+
+			att, attErr := strconv.Atoi(jobVals["Attempt"].(string))
+			if attErr != nil {
+				return nil, fmt.Errorf("invalid attempt field for job %s: %w", messageJob.ID, attErr)
+			}
+			maxAtt, maxAttErr := strconv.Atoi(jobVals["MaxAttempts"].(string))
+			if maxAttErr != nil {
+				return nil, fmt.Errorf("invalid max attempt field for job %s: %w", messageJob.ID, maxAttErr)
+			}
+			creatP, creatPErr := time.Parse(time.RFC3339Nano, jobVals["CreatedAt"].(string))
+			if creatPErr != nil {
+				return nil, fmt.Errorf("invalid created at field for job %s: %w", messageJob.ID, creatPErr)
+			}
+			avaiP, avaiPErr := time.Parse(time.RFC3339Nano, jobVals["AvailableAt"].(string))
+			if avaiPErr != nil {
+				return nil, fmt.Errorf("invalid available at field for job %s: %w", messageJob.ID, avaiPErr)
+			}
+
+			j := queue.Job{
+				ID:          queue.JobID(messageJob.ID),
+				Task:        jobVals["Task"].(string),
+				Payload:     json.RawMessage(jobVals["Payload"].(string)),
+				Attempt:     att,
+				MaxAttempts: maxAtt,
+				TraceID:     jobVals["TraceID"].(string),
+				CreatedAt:   creatP,
+				AvailableAt: avaiP,
+			}
+
+			jobs = append(jobs, j)
+		}
+	}
+
+	return jobs, nil
 }
 
 func (b *Backend) Ack(ctx context.Context, jobID queue.JobID) error {
 	// TODO: Use XACK after a handler succeeds.
-	return queue.ErrNotImplemented
+	_, err := b.rds.XAck(ctx, b.config.Stream, b.config.Group, string(jobID)).Result()
+	return err
 }
 
 func (b *Backend) Retry(ctx context.Context, job queue.Job, nextRunAt time.Time) error {
