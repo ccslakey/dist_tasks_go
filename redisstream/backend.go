@@ -2,12 +2,12 @@ package redisstream
 
 import (
 	"context"
+	"dist_tasks_go/queue"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
-
-	"dist_tasks_go/queue"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -63,13 +63,13 @@ func (b *Backend) Enqueue(ctx context.Context, job queue.Job) (queue.JobID, erro
 	args := redis.XAddArgs{
 		Stream: b.config.Stream,
 		Values: map[string]interface{}{
-			"Task":        job.Task,
-			"Payload":     string(job.Payload),
-			"Attempt":     job.Attempt,
-			"MaxAttempts": job.MaxAttempts,
-			"TraceID":     job.TraceID,
-			"CreatedAt":   job.CreatedAt.Format(time.RFC3339Nano),
-			"AvailableAt": job.AvailableAt.Format(time.RFC3339Nano),
+			"task":        job.Task,
+			"payload":     string(job.Payload),
+			"attempt":     job.Attempt,
+			"maxAttempts": job.MaxAttempts,
+			"traceID":     job.TraceID,
+			"createdAt":   job.CreatedAt.Format(time.RFC3339Nano),
+			"availableAt": job.AvailableAt.Format(time.RFC3339Nano),
 		},
 	}
 	val, err := b.rds.XAdd(ctx, &args).Result()
@@ -90,6 +90,10 @@ func (b *Backend) Claim(ctx context.Context, workerID string, limit int) ([]queu
 
 	streams, xrErr := b.rds.XReadGroup(ctx, &args).Result()
 
+	if errors.Is(xrErr, redis.Nil) {
+		return []queue.Job{}, nil
+	}
+
 	if xrErr != nil {
 		return nil, fmt.Errorf("err in xreadgroup. workerId:err %s: %w", workerID, xrErr)
 	}
@@ -102,30 +106,42 @@ func (b *Backend) Claim(ctx context.Context, workerID string, limit int) ([]queu
 		for _, messageJob := range s.Messages {
 			jobVals := messageJob.Values
 
-			att, attErr := strconv.Atoi(jobVals["Attempt"].(string))
+			att, attErr := strconv.Atoi(jobVals["attempt"].(string))
 			if attErr != nil {
 				return nil, fmt.Errorf("invalid attempt field for job %s: %w", messageJob.ID, attErr)
 			}
-			maxAtt, maxAttErr := strconv.Atoi(jobVals["MaxAttempts"].(string))
+			maxAtt, maxAttErr := strconv.Atoi(jobVals["maxAttempts"].(string))
 			if maxAttErr != nil {
 				return nil, fmt.Errorf("invalid max attempt field for job %s: %w", messageJob.ID, maxAttErr)
 			}
-			creatP, creatPErr := time.Parse(time.RFC3339Nano, jobVals["CreatedAt"].(string))
+			creatP, creatPErr := time.Parse(time.RFC3339Nano, jobVals["createdAt"].(string))
 			if creatPErr != nil {
 				return nil, fmt.Errorf("invalid created at field for job %s: %w", messageJob.ID, creatPErr)
 			}
-			avaiP, avaiPErr := time.Parse(time.RFC3339Nano, jobVals["AvailableAt"].(string))
+			avaiP, avaiPErr := time.Parse(time.RFC3339Nano, jobVals["availableAt"].(string))
 			if avaiPErr != nil {
 				return nil, fmt.Errorf("invalid available at field for job %s: %w", messageJob.ID, avaiPErr)
+			}
+			task, taskOk := jobVals["task"].(string)
+			if !taskOk {
+				return nil, fmt.Errorf("invalid task field for job %s", messageJob.ID)
+			}
+			pl, plOk := jobVals["payload"].(string)
+			if !plOk {
+				return nil, fmt.Errorf("invalid payload field for job %s", messageJob.ID)
+			}
+			tId, tIdOk := jobVals["traceID"].(string)
+			if !tIdOk {
+				return nil, fmt.Errorf("invalid trace id field for job %s", messageJob.ID)
 			}
 
 			j := queue.Job{
 				ID:          queue.JobID(messageJob.ID),
-				Task:        jobVals["Task"].(string),
-				Payload:     json.RawMessage(jobVals["Payload"].(string)),
+				Task:        task,
+				Payload:     json.RawMessage(pl),
 				Attempt:     att,
 				MaxAttempts: maxAtt,
-				TraceID:     jobVals["TraceID"].(string),
+				TraceID:     tId,
 				CreatedAt:   creatP,
 				AvailableAt: avaiP,
 			}

@@ -43,7 +43,7 @@ enqueue-demo / application code
 - [x] Redis consumer group claim/dequeue
 - [x] Redis `XACK` success path
 - [x] `RetryPolicy.NextDelay` exponential backoff
-- [ ] `Worker.handleOne` dispatch and outcome routing
+- [x] `Worker.handleOne` dispatch and outcome routing
 - [ ] Retry scheduling and promotion
 - [ ] Dead-letter movement
 - [ ] Visibility timeout recovery with `XAUTOCLAIM`
