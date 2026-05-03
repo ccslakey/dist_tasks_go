@@ -49,7 +49,6 @@ func TestStartTimesCleanedUpOnCompleted(t *testing.T) {
 }
 
 // Retryable failure path: Started → Failed → Retried should leave the map empty.
-// Currently leaks because neither JobFailed nor JobRetried calls LoadAndDelete.
 func TestStartTimesCleanedUpOnRetried(t *testing.T) {
 	m := newMetrics()
 	job := queue.Job{ID: "job-2", Task: "email"}
@@ -64,7 +63,6 @@ func TestStartTimesCleanedUpOnRetried(t *testing.T) {
 }
 
 // Permanent failure path: Started → Failed → DeadLettered should leave the map empty.
-// Currently leaks for the same reason.
 func TestStartTimesCleanedUpOnDeadLettered(t *testing.T) {
 	m := newMetrics()
 	job := queue.Job{ID: "job-3", Task: "email"}
