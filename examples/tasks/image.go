@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"log/slog"
 
 	"dist_tasks_go/queue"
 )
@@ -23,7 +23,11 @@ func ProcessImage(ctx context.Context, job queue.Job) queue.JobResult {
 		return queue.NewPermanentError(errors.New("image id is required"))
 	}
 
-	// TODO: Add a controlled flaky branch to exercise retries during demos.
-	fmt.Printf("process image id=%s url=%s\n", payload.ImageID, payload.URL)
+	slog.InfoContext(ctx, "processing image",
+		"job_id", job.ID,
+		"attempt", job.Attempt,
+		"image_id", payload.ImageID,
+		"url", payload.URL,
+	)
 	return queue.JobResult{}
 }

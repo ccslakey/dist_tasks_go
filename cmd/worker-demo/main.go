@@ -2,36 +2,40 @@ package main
 
 import (
 	"context"
-	"log"
-	"net/http"
-	"os/signal"
-	"syscall"
-	"time"
-
 	"dist_tasks_go/examples/tasks"
+	"dist_tasks_go/internal/prettylog"
 	"dist_tasks_go/prommetrics"
 	"dist_tasks_go/queue"
 	"dist_tasks_go/redisstream"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
+	slog.SetDefault(slog.New(prettylog.NewHandler(os.Stdout)))
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	backend, err := redisstream.New(redisstream.Config{})
 	if err != nil {
-		log.Fatal(err)
+		slog.Error(err.Error())
 	}
 
 	m := prommetrics.New(nil)
 
 	http.Handle("/metrics", promhttp.Handler())
 	go func() {
-		log.Println("metrics listening on :9090/metrics")
+		slog.Info("metrics listening on :9090/metrics")
 		if err := http.ListenAndServe(":9090", nil); err != nil {
-			log.Printf("metrics server: %v", err)
+			slog.Error(fmt.Sprintf("metrics server: %v", err))
 		}
 	}()
 
@@ -44,13 +48,13 @@ func main() {
 	}, m)
 
 	if err := worker.Register("send_email", tasks.SendEmail); err != nil {
-		log.Fatal(err)
+		slog.Error(err.Error())
 	}
 	if err := worker.Register("process_image", tasks.ProcessImage); err != nil {
-		log.Fatal(err)
+		slog.Error(err.Error())
 	}
 
 	if err := worker.Run(ctx); err != nil && err != context.Canceled {
-		log.Fatal(err)
+		slog.Error(err.Error())
 	}
 }

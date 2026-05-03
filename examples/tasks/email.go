@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"log/slog"
 
 	"dist_tasks_go/queue"
 )
@@ -24,7 +24,11 @@ func SendEmail(ctx context.Context, job queue.Job) queue.JobResult {
 		return queue.NewPermanentError(errors.New("email recipient is required"))
 	}
 
-	// TODO: Replace this print with a realistic side effect once the queue core works.
-	fmt.Printf("send email to=%s subject=%q\n", payload.To, payload.Subject)
+	slog.InfoContext(ctx, "sending email",
+		"job_id", job.ID,
+		"attempt", job.Attempt,
+		"to", payload.To,
+		"subject", payload.Subject,
+	)
 	return queue.JobResult{}
 }
