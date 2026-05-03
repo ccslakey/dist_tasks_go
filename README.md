@@ -51,7 +51,7 @@ enqueue-demo / application code
 - [x] Graceful shutdown of in-flight jobs
 - [x] `Store.Stats` gauges (queue depth, in-flight, retries, DLQ)
 - [x] Real Docker-backed Redis test harness (`internal/testredis.Start`) and baseline integration tests for enqueue/claim/ack, retry promotion, and dead-letter
-- [ ] Prometheus metrics adapter
+- [x] Prometheus metrics adapter (`prommetrics.Metrics` — counters, histogram, gauges wired into both demo commands; `/metrics` endpoint on `:9090`)
 
 ## Run Locally
 

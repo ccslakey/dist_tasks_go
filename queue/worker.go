@@ -62,7 +62,6 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 
 	//worker loop.
-	// 1. periodically call RecoverExpired so abandoned leases become runnable again
 	ticker := time.NewTicker(w.config.PollInterval)
 	defer ticker.Stop()
 	var wg sync.WaitGroup
@@ -70,7 +69,13 @@ func (w *Worker) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ticker.C:
+
+			// 1. periodically call RecoverExpired so abandoned leases become runnable again
 			w.backend.RecoverExpired(ctx, w.config.VisibilityTimeout, w.config.ID)
+			// observe for metrics
+			if st, err := w.backend.Stats(ctx); err == nil {
+				w.metrics.StatsObserved(ctx, st)
+			}
 
 			// 2. claim up to available concurrency from the backend
 			claimedJobs, err := w.backend.Claim(ctx, w.config.ID, w.config.Concurrency)

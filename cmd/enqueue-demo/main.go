@@ -6,6 +6,7 @@ import (
 	"log"
 
 	"dist_tasks_go/examples/tasks"
+	"dist_tasks_go/prommetrics"
 	"dist_tasks_go/queue"
 	"dist_tasks_go/redisstream"
 )
@@ -18,7 +19,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	q := queue.New(backend)
+	m := prommetrics.New(nil)
+	q := queue.New(backend, queue.WithMetrics(m))
 	id, err := q.Enqueue(ctx, "send_email", tasks.EmailPayload{
 		To:      "dev@example.com",
 		Subject: "Distributed queue demo",

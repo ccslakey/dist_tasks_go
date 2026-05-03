@@ -2,8 +2,7 @@
 // queue.Metrics. Register a *Metrics with a prometheus.Registerer (or pass
 // nil to use the default registry) and pass it to queue.NewWorker / queue.New.
 //
-// Expose the registry over HTTP with promhttp.Handler() — see the example in
-// cmd/worker-demo (TODO) or:
+// Expose the registry over HTTP as in cmd/worker-demo:
 //
 //	http.Handle("/metrics", promhttp.Handler())
 //	http.ListenAndServe(":9090", nil)
@@ -11,9 +10,9 @@ package prommetrics
 
 import (
 	"context"
-	"time"
-
 	"dist_tasks_go/queue"
+	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -31,16 +30,14 @@ type Metrics struct {
 	deadLettered *prometheus.CounterVec
 	duration     *prometheus.HistogramVec
 
-	queueDepth      prometheus.Gauge
+	streamLength    prometheus.Gauge
 	inFlight        prometheus.Gauge
 	deadLetterDepth prometheus.Gauge
 	retryScheduled  prometheus.Gauge
 
 	// startTimes tracks per-job start timestamps so JobCompleted/JobFailed can
-	// observe duration. The map is keyed by JobID. A real implementation
-	// should use a sync.Map or stash the start time on the Job itself; this
-	// scaffold leaves it as a TODO.
-	// startTimes sync.Map
+	// observe duration. The map is keyed by JobID.
+	startTimes sync.Map
 }
 
 // New constructs a Metrics and registers all collectors with reg. Pass
@@ -83,9 +80,9 @@ func New(reg prometheus.Registerer) *Metrics {
 			Buckets: prometheus.DefBuckets, // 5ms .. 10s; tune per workload
 		}, []string{taskLabel}),
 
-		queueDepth: factory.NewGauge(prometheus.GaugeOpts{
-			Name: "dtq_queue_depth",
-			Help: "Current number of jobs waiting in the main stream (XLEN).",
+		streamLength: factory.NewGauge(prometheus.GaugeOpts{
+			Name: "dtq_stream_length",
+			Help: "Total entries currently in the main stream (XLEN). Includes completed but untrimmed entries.",
 		}),
 		inFlight: factory.NewGauge(prometheus.GaugeOpts{
 			Name: "dtq_in_flight_jobs",
@@ -108,15 +105,16 @@ func (m *Metrics) JobEnqueued(_ context.Context, job queue.Job) {
 }
 
 func (m *Metrics) JobStarted(_ context.Context, job queue.Job) {
+	// stash time.Now() so JobCompleted/JobFailed can call duration.Observe.
+	m.startTimes.Store(job.ID, time.Now())
 	m.started.WithLabelValues(job.Task).Inc()
-	// TODO: stash time.Now() so JobCompleted/JobFailed can call duration.Observe.
-	// Either attach to ctx, store on the Job, or use an internal sync.Map keyed by JobID.
 }
 
 func (m *Metrics) JobCompleted(_ context.Context, job queue.Job) {
+	if start, ok := m.startTimes.LoadAndDelete(job.ID); ok {
+		m.duration.WithLabelValues(job.Task).Observe(time.Since(start.(time.Time)).Seconds())
+	}
 	m.completed.WithLabelValues(job.Task).Inc()
-	// TODO: m.duration.WithLabelValues(job.Task).Observe(time.Since(start).Seconds())
-	_ = time.Second
 }
 
 func (m *Metrics) JobFailed(_ context.Context, job queue.Job, retryable bool) {
@@ -128,15 +126,21 @@ func (m *Metrics) JobFailed(_ context.Context, job queue.Job, retryable bool) {
 }
 
 func (m *Metrics) JobRetried(_ context.Context, job queue.Job) {
+	if start, ok := m.startTimes.LoadAndDelete(job.ID); ok {
+		m.duration.WithLabelValues(job.Task).Observe(time.Since(start.(time.Time)).Seconds())
+	}
 	m.retried.WithLabelValues(job.Task).Inc()
 }
 
 func (m *Metrics) JobDeadLettered(_ context.Context, job queue.Job) {
+	if start, ok := m.startTimes.LoadAndDelete(job.ID); ok {
+		m.duration.WithLabelValues(job.Task).Observe(time.Since(start.(time.Time)).Seconds())
+	}
 	m.deadLettered.WithLabelValues(job.Task).Inc()
 }
 
 func (m *Metrics) StatsObserved(_ context.Context, stats queue.Stats) {
-	m.queueDepth.Set(float64(stats.QueueDepth))
+	m.streamLength.Set(float64(stats.StreamLength))
 	m.inFlight.Set(float64(stats.InFlight))
 	m.deadLetterDepth.Set(float64(stats.DeadLetterDepth))
 	m.retryScheduled.Set(float64(stats.RetryScheduled))

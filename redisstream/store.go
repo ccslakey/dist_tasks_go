@@ -302,14 +302,9 @@ func (b *Store) Stats(ctx context.Context) (queue.Stats, error) {
 	}
 
 	return queue.Stats{
-		QueueDepth:        streamLen,
-		InFlight:          pend.Count,
-		DeadLetterDepth:   deadLen,
-		RetryScheduled:    retries,
-		TotalEnqueued:     0, //from metrics/counter store
-		TotalCompleted:    0, //
-		TotalFailed:       0, //
-		TotalRetried:      0, //
-		TotalDeadLettered: 0, //
+		StreamLength:    streamLen,
+		InFlight:        pend.Count,
+		DeadLetterDepth: deadLen,
+		RetryScheduled:  retries,
 	}, nil
 }

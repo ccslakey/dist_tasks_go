@@ -17,7 +17,7 @@ type Backend interface {
 
 type Stats struct {
 	// Point-in-time gauges (derivable from Redis state):
-	QueueDepth      int64 // jobs sitting in the main stream — XLEN <stream>
+	StreamLength    int64 // total entries in the main stream — XLEN <stream>
 	InFlight        int64 // jobs claimed but not yet Ack'd (PEL size) — XPending(...).Count
 	DeadLetterDepth int64 // jobs in the DLQ stream — XLEN <dlq>
 	RetryScheduled  int64 // jobs waiting in the retry sorted set — ZCARD <retryKey>
