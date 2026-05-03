@@ -33,7 +33,7 @@ application code (cmd/enqueue-demo)
  queue.Backend          — interface: Enqueue, Claim, Ack, Retry, DeadLetter,
         |                 RecoverExpired, Stats
         v
- redisstream.Backend    — all methods currently return ErrNotImplemented
+ redisstream.Store      — all methods currently return ErrNotImplemented
         |
         v
  Redis Streams (main stream) + sorted set (retry schedule) + DLQ stream
@@ -58,15 +58,15 @@ application code (cmd/enqueue-demo)
 
 ## Implementation Path (ordered TODOs)
 
-1. `redisstream.Backend.Enqueue` — `XADD` to main stream
+1. `redisstream.Store.Enqueue` — `XADD` to main stream
 2. Consumer group creation in `redisstream.New`
-3. `Backend.Claim` — `XREADGROUP` to claim jobs
-4. `Backend.Ack` — `XACK` after handler success
-5. `Backend.Retry` — store in sorted set keyed by next-run Unix ms; fill in `promoteRetriesScript` in [redisstream/scripts.go](redisstream/scripts.go) to promote due entries back to the main stream
-6. `Backend.DeadLetter` — `XADD` to DLQ stream with failure reason
-7. `Backend.RecoverExpired` — `XAUTOCLAIM` for abandoned leases
+3. `Store.Claim` — `XREADGROUP` to claim jobs
+4. `Store.Ack` — `XACK` after handler success
+5. `Store.Retry` — store in sorted set keyed by next-run Unix ms; fill in `promoteRetriesScript` in [redisstream/scripts.go](redisstream/scripts.go) to promote due entries back to the main stream
+6. `Store.DeadLetter` — `XADD` to DLQ stream with failure reason
+7. `Store.RecoverExpired` — `XAUTOCLAIM` for abandoned leases
 8. `Worker.Run` in [queue/worker.go](queue/worker.go) — bounded goroutine pool, poll loop, graceful shutdown
-9. `Backend.Stats` — `XLEN`, `XPENDING`, sorted-set cardinality
+9. `Store.Stats` — `XLEN`, `XPENDING`, sorted-set cardinality
 10. Prometheus `Metrics` implementation
 
 ## Testing

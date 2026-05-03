@@ -22,7 +22,7 @@ enqueue-demo / application code
  queue.Backend interface
         |
         v
- redisstream.Backend
+ redisstream.Store
         |
         v
  Redis Streams + retry schedule + dead-letter stream
@@ -44,12 +44,13 @@ enqueue-demo / application code
 - [x] Redis `XACK` success path
 - [x] `RetryPolicy.NextDelay` exponential backoff
 - [x] `Worker.handleOne` dispatch and outcome routing
-- [ ] Retry scheduling and promotion
-- [ ] fill in backend.Stats
+- [x] Retry scheduling and promotion
 - [x] Dead-letter movement
 - [x] Visibility timeout recovery with `XAUTOCLAIM`
-- [ ] Worker concurrency loop
-- [ ] Graceful shutdown of in-flight jobs
+- [x] Worker concurrency loop
+- [x] Graceful shutdown of in-flight jobs
+- [x] `Store.Stats` gauges (queue depth, in-flight, retries, DLQ)
+- [x] Real Docker-backed Redis test harness (`internal/testredis.Start`) and baseline integration tests for enqueue/claim/ack, retry promotion, and dead-letter
 - [ ] Prometheus metrics adapter
 
 ## Run Locally
@@ -75,18 +76,20 @@ go run ./cmd/worker-demo
 
 ## Implementation Path
 
-1. ~~Implement `redisstream.Backend.Enqueue` with `XADD`.~~
+1. ~~Implement `redisstream.Store.Enqueue` with `XADD`.~~
 2. ~~Create or ensure the Redis consumer group during backend initialization.~~
 3. ~~Implement `Claim` using `XREADGROUP`.~~
 4. ~~Implement `Ack` using `XACK`.~~
-5. Implement `RetryPolicy.NextDelay` with exponential backoff (`queue/retry.go`).
-6. Implement `Worker.handleOne` dispatch and outcome routing (`queue/worker.go`).
-7. Implement retry scheduling with a Redis sorted set keyed by next-run timestamp.
-8. Promote due retries back into the main stream (fill in `promoteRetriesScript` in `redisstream/scripts.go`).
-9. Implement `DeadLetter` with a separate stream that stores the original job and failure reason.
-10. Implement lease recovery with `XAUTOCLAIM` or `XPENDING` plus `XCLAIM`.
-11. Replace `Worker.Run` with a real bounded goroutine worker loop.
-12. Add a Prometheus-backed `queue.Metrics` implementation.
+5. ~~Implement `RetryPolicy.NextDelay` with exponential backoff (`queue/retry.go`).~~
+6. ~~Implement `Worker.handleOne` dispatch and outcome routing (`queue/worker.go`).~~
+7. ~~Implement retry scheduling with a Redis sorted set keyed by next-run timestamp.~~
+8. ~~Promote due retries back into the main stream (`Store.promoteRetries`, called from `Claim`).~~
+9. ~~Implement `DeadLetter` with a separate stream that stores the original job and failure reason.~~
+10. ~~Implement lease recovery with `XAUTOCLAIM`.~~
+11. ~~Replace `Worker.Run` with a real bounded goroutine worker loop.~~
+12. ~~Implement `Store.Stats` (`XLEN`, `XPENDING`, `ZCARD`).~~
+13. ~~Replace the `t.Skip` in `internal/testredis.Start` with a real Docker-backed Redis connection and add baseline integration tests.~~
+14. Add a Prometheus-backed `queue.Metrics` implementation — also the natural home for the lifetime `Total*` counters in `queue.Stats` that Redis can't track.
 
 ## Failure Semantics To Understand
 

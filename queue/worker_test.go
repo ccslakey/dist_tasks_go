@@ -39,3 +39,4 @@ func (fakeBackend) Retry(context.Context, Job, time.Time) error                 
 func (fakeBackend) DeadLetter(context.Context, Job, string) error                      { return nil }
 func (fakeBackend) RecoverExpired(context.Context, time.Duration, string) (int, error) { return 0, nil }
 func (fakeBackend) Stats(context.Context) (Stats, error)                               { return Stats{}, nil }
+func (fakeBackend) promoteRetries(ctx context.Context, limit int) (int, error)         { return 0, nil }

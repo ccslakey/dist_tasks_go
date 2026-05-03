@@ -61,17 +61,37 @@ func (w *Worker) Run(ctx context.Context) error {
 		return fmt.Errorf("worker id is required")
 	}
 
-	// TODO: Implement the real worker loop.
-	// Desired behavior:
+	//worker loop.
 	// 1. periodically call RecoverExpired so abandoned leases become runnable again
-	// 2. claim up to available concurrency from the backend
-	// 3. run handlers in goroutines, bounded by Concurrency
-	// 4. Ack successful jobs
-	// 5. Retry retryable failures with RetryPolicy
-	// 6. DeadLetter exhausted or permanent failures
-	// 7. stop claiming on cancellation and wait for in-flight handlers to finish
-	<-ctx.Done()
-	return ctx.Err()
+	ticker := time.NewTicker(w.config.PollInterval)
+	defer ticker.Stop()
+	var wg sync.WaitGroup
+
+	for {
+		select {
+		case <-ticker.C:
+			w.backend.RecoverExpired(ctx, w.config.VisibilityTimeout, w.config.ID)
+
+			// 2. claim up to available concurrency from the backend
+			claimedJobs, err := w.backend.Claim(ctx, w.config.ID, w.config.Concurrency)
+			if err != nil {
+				return err
+			}
+
+			// 3. run handlers in goroutines, bounded by Concurrency
+			for _, job := range claimedJobs {
+				wg.Go(func() {
+					w.handleOne(ctx, job)
+				})
+			}
+
+		case <-ctx.Done():
+			// 4.  stop claiming on cancellation and wait for in-flight handlers to finish
+			wg.Wait()
+			return ctx.Err()
+		}
+	}
+
 }
 
 // Implement job dispatch and outcome routing.
@@ -105,9 +125,4 @@ func (w *Worker) handleOne(ctx context.Context, job Job) error {
 		w.metrics.JobRetried(ctx, job)
 		return err
 	}
-}
-
-func waitAll(wg *sync.WaitGroup, done chan<- struct{}) {
-	wg.Wait()
-	close(done)
 }
