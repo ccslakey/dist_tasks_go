@@ -53,6 +53,12 @@ func main() {
 	if err := worker.Register("process_image", tasks.ProcessImage); err != nil {
 		slog.Error(err.Error())
 	}
+	if err := worker.Register("permanent_fail", tasks.PermanentFail); err != nil {
+		slog.Error(err.Error())
+	}
+	if err := worker.Register("flaky_email", tasks.FlakyEmail); err != nil {
+		slog.Error(err.Error())
+	}
 
 	if err := worker.Run(ctx); err != nil && err != context.Canceled {
 		slog.Error(err.Error())
