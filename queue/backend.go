@@ -11,7 +11,7 @@ type Backend interface {
 	Ack(ctx context.Context, jobID JobID) error
 	Retry(ctx context.Context, job Job, nextRunAt time.Time) error
 	DeadLetter(ctx context.Context, job Job, reason string) error
-	RecoverExpired(ctx context.Context, visibilityTimeout time.Duration) (int, error)
+	RecoverExpired(ctx context.Context, visibilityTimeout time.Duration, workerId string) (int, error)
 	Stats(ctx context.Context) (Stats, error)
 }
 

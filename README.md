@@ -45,8 +45,9 @@ enqueue-demo / application code
 - [x] `RetryPolicy.NextDelay` exponential backoff
 - [x] `Worker.handleOne` dispatch and outcome routing
 - [ ] Retry scheduling and promotion
-- [ ] Dead-letter movement
-- [ ] Visibility timeout recovery with `XAUTOCLAIM`
+- [ ] fill in backend.Stats
+- [x] Dead-letter movement
+- [x] Visibility timeout recovery with `XAUTOCLAIM`
 - [ ] Worker concurrency loop
 - [ ] Graceful shutdown of in-flight jobs
 - [ ] Prometheus metrics adapter

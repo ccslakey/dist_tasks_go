@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -49,7 +50,7 @@ func New(config Config) (*Backend, error) {
 	})
 
 	_, err := rdsCli.XGroupCreateMkStream(context.Background(), config.Stream, config.Group, "$").Result()
-	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
 		return nil, err
 	}
 
@@ -79,7 +80,7 @@ func (b *Backend) Enqueue(ctx context.Context, job queue.Job) (queue.JobID, erro
 }
 
 func (b *Backend) Claim(ctx context.Context, workerID string, limit int) ([]queue.Job, error) {
-	// TODO: Use XREADGROUP to claim new jobs for workerID.
+	// Use XREADGROUP to claim new jobs for workerID.
 
 	args := redis.XReadGroupArgs{
 		Group:    b.config.Group,
@@ -154,25 +155,76 @@ func (b *Backend) Claim(ctx context.Context, workerID string, limit int) ([]queu
 }
 
 func (b *Backend) Ack(ctx context.Context, jobID queue.JobID) error {
-	// TODO: Use XACK after a handler succeeds.
+	// XACK after a handler succeeds.
 	_, err := b.rds.XAck(ctx, b.config.Stream, b.config.Group, string(jobID)).Result()
 	return err
 }
 
 func (b *Backend) Retry(ctx context.Context, job queue.Job, nextRunAt time.Time) error {
-	// TODO: Increment attempt metadata and schedule for nextRunAt.
-	// A Redis sorted set keyed by Unix milliseconds is a simple v1 option.
-	return queue.ErrNotImplemented
+	// Schedule the job for a future retry using a Redis sorted set.
+	// - Increment job.Attempt before storing so the next execution reflects the right attempt number.
+	job.Attempt++
+
+	// - Serialize the updated job to JSON (json.Marshal).
+	jobBytes, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+	// - Use ZADD on b.config.RetryKey with score = nextRunAt.UnixMilli() and member = serialized job.
+	_, err = b.rds.ZAdd(ctx, b.config.RetryKey, redis.Z{
+		Score:  float64(nextRunAt.UnixMilli()),
+		Member: jobBytes,
+	}).Result()
+
+	if err != nil {
+		return err
+	}
+	// The sorted set acts as a delay queue: jobs become "due" once the current time passes their score.
+	// Claim will later promote due entries back into the main stream (see promoteRetriesScript).
+	return b.Ack(ctx, job.ID)
 }
 
 func (b *Backend) DeadLetter(ctx context.Context, job queue.Job, reason string) error {
-	// TODO: Move job details plus reason into b.config.DeadLetter.
-	return queue.ErrNotImplemented
+	//  Permanently record the failed job in the dead-letter stream.
+	// - Use XADD on b.config.DeadLetter (a separate stream from the main one).
+	// - Store the same fields as Enqueue, plus a "reason" field containing the failure message.
+	args := redis.XAddArgs{
+		Stream: b.config.DeadLetter,
+		Values: map[string]interface{}{
+			"task":        job.Task,
+			"payload":     string(job.Payload),
+			"attempt":     job.Attempt,
+			"maxAttempts": job.MaxAttempts,
+			"traceID":     job.TraceID,
+			"createdAt":   job.CreatedAt.Format(time.RFC3339Nano),
+			"availableAt": job.AvailableAt.Format(time.RFC3339Nano),
+			"reason":      reason,
+		},
+	}
+	_, err := b.rds.XAdd(ctx, &args).Result()
+	if err != nil {
+		return err
+	}
+
+	return b.Ack(ctx, job.ID)
 }
 
-func (b *Backend) RecoverExpired(ctx context.Context, visibilityTimeout time.Duration) (int, error) {
-	// TODO: Use XPENDING/XAUTOCLAIM so jobs held by dead workers become claimable again.
-	return 0, queue.ErrNotImplemented
+func (b *Backend) RecoverExpired(ctx context.Context, visibilityTimeout time.Duration, workerID string) (int, error) {
+	// Use XPENDING/XAUTOCLAIM so jobs held by dead workers become claimable again.
+	claimArgs := redis.XAutoClaimArgs{
+		Stream:   b.config.Stream,
+		MinIdle:  visibilityTimeout,
+		Group:    b.config.Group,
+		Start:    "0-0",
+		Consumer: workerID,
+	}
+
+	val, _, err := b.rds.XAutoClaim(ctx, &claimArgs).Result()
+	if err != nil {
+		return 0, err
+	}
+
+	return len(val), err
 }
 
 func (b *Backend) Stats(ctx context.Context) (queue.Stats, error) {
