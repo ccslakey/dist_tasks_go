@@ -2,6 +2,7 @@ package testredis
 
 import (
 	"context"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -31,17 +32,27 @@ func Start(t *testing.T) Instance {
 		addr = "localhost:6379"
 	}
 
+	// Probe with a plain TCP dial first. Letting go-redis discover that nothing
+	// is listening means its pool retries the dial and logs several lines, per
+	// test, which turns a missing Redis into seconds of noise across the
+	// package instead of one clear message.
+	conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	if err != nil {
+		unavailable(t, addr, err)
+	}
+	conn.Close()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client := redis.NewClient(&redis.Options{Addr: addr})
+	client := redis.NewClient(&redis.Options{
+		Addr:        addr,
+		MaxRetries:  -1, // something is listening; if it does not answer PING, say so once
+		DialTimeout: time.Second,
+	})
 	if err := client.Ping(ctx).Err(); err != nil {
 		client.Close()
-		msg := "redis unavailable at %s: %v (start it with `docker compose up -d redis`)"
-		if os.Getenv("DTQ_REQUIRE_REDIS") != "" {
-			t.Fatalf(msg, addr, err)
-		}
-		t.Skipf(msg, addr, err)
+		unavailable(t, addr, err)
 	}
 
 	t.Cleanup(func() {
@@ -52,4 +63,13 @@ func Start(t *testing.T) Instance {
 	})
 
 	return Instance{Addr: addr}
+}
+
+func unavailable(t *testing.T, addr string, err error) {
+	t.Helper()
+	const msg = "redis unavailable at %s: %v (start it with `docker compose up -d redis`)"
+	if os.Getenv("DTQ_REQUIRE_REDIS") != "" {
+		t.Fatalf(msg, addr, err)
+	}
+	t.Skipf(msg, addr, err)
 }

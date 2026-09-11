@@ -1,12 +1,20 @@
-// Command loadtest measures end-to-end throughput and latency against a real
-// Redis.
+// Command loadtest measures throughput and latency against a real Redis.
 //
-// It enqueues a fixed number of no-op jobs, runs a set of workers against them,
-// and reports how long the drain took. Handler time is configurable but zero by
-// default, so the numbers describe queue overhead rather than whatever the
-// handler happens to do.
+// Handler time is configurable but zero by default, so the numbers describe
+// queue overhead rather than whatever the handler happens to do.
 //
-//	go run ./cmd/loadtest -jobs 20000 -workers 4 -concurrency 32
+// Two modes, because they measure different things and the same run cannot do
+// both honestly:
+//
+//	go run ./cmd/loadtest                  # steady state: workers run while jobs arrive
+//	go run ./cmd/loadtest -prefill         # backlog drain: fill the queue, then start workers
+//
+// Steady state is where the latency percentiles mean something: a job's clock
+// starts when it is enqueued and there is already a worker free to take it, so
+// the number is queue overhead. Prefill deliberately builds a backlog to find
+// peak drain throughput, which means the first job waits out the entire
+// enqueue phase, so per-job latency there measures the backlog and is not
+// reported.
 package main
 
 import (
@@ -30,6 +38,7 @@ func main() {
 	handlerTime := flag.Duration("handler-time", 0, "artificial work per job")
 	addr := flag.String("addr", "localhost:6379", "redis address")
 	timeout := flag.Duration("timeout", 2*time.Minute, "give up after this long")
+	prefill := flag.Bool("prefill", false, "enqueue every job before starting workers, to measure peak drain throughput instead of steady-state latency")
 	flag.Parse()
 
 	// A fresh key namespace per run, so a load test never mixes with demo data
@@ -55,16 +64,6 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	fmt.Printf("enqueueing %d jobs...\n", *jobs)
-	enqueueStart := time.Now()
-	for i := range *jobs {
-		_, err := q.Enqueue(ctx, "noop", map[string]int{"n": i}, queue.EnqueueOptions{MaxAttempts: 1})
-		if err != nil {
-			log.Fatalf("enqueue job %d: %v", i, err)
-		}
-	}
-	enqueueElapsed := time.Since(enqueueStart)
-
 	handler := func(ctx context.Context, job queue.Job) queue.JobResult {
 		if *handlerTime > 0 {
 			select {
@@ -76,30 +75,52 @@ func main() {
 		return queue.JobResult{}
 	}
 
-	fmt.Printf("draining with %d workers x %d concurrency...\n", *workers, *concurrency)
-	drainStart := time.Now()
-
 	workerCtx, stopWorkers := context.WithCancel(ctx)
 	defer stopWorkers()
 
 	var wg sync.WaitGroup
-	for w := range *workers {
-		worker := queue.NewWorker(backend, queue.WorkerConfig{
-			ID:                fmt.Sprintf("loadtest-%d", w),
-			Concurrency:       *concurrency,
-			PollInterval:      5 * time.Millisecond,
-			VisibilityTimeout: 30 * time.Second,
-			RetryPolicy:       queue.DefaultRetryPolicy(),
-		}, collector)
-		if err := worker.Register("noop", handler); err != nil {
-			log.Fatalf("register handler: %v", err)
-		}
+	startWorkers := func() {
+		fmt.Printf("running %d workers x %d concurrency...\n", *workers, *concurrency)
+		for w := range *workers {
+			worker := queue.NewWorker(backend, queue.WorkerConfig{
+				ID:                fmt.Sprintf("loadtest-%d", w),
+				Concurrency:       *concurrency,
+				PollInterval:      5 * time.Millisecond,
+				VisibilityTimeout: 30 * time.Second,
+				RetryPolicy:       queue.DefaultRetryPolicy(),
+			}, collector)
+			if err := worker.Register("noop", handler); err != nil {
+				log.Fatalf("register handler: %v", err)
+			}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = worker.Run(workerCtx)
-		}()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = worker.Run(workerCtx)
+			}()
+		}
+	}
+
+	// In steady state the workers have to be up before the first job lands,
+	// otherwise every job's clock starts while there is nobody to run it and
+	// the percentiles just measure the enqueue loop.
+	if !*prefill {
+		startWorkers()
+	}
+
+	fmt.Printf("enqueueing %d jobs...\n", *jobs)
+	runStart := time.Now()
+	for i := range *jobs {
+		_, err := q.Enqueue(ctx, "noop", map[string]int{"n": i}, queue.EnqueueOptions{MaxAttempts: 1})
+		if err != nil {
+			log.Fatalf("enqueue job %d: %v", i, err)
+		}
+	}
+	enqueueElapsed := time.Since(runStart)
+
+	drainStart := time.Now()
+	if *prefill {
+		startWorkers()
 	}
 
 	select {
@@ -113,23 +134,55 @@ func main() {
 	}
 
 	drainElapsed := time.Since(drainStart)
+	totalElapsed := time.Since(runStart)
 	stopWorkers()
 	wg.Wait()
 
-	report(*jobs, *workers, *concurrency, *handlerTime, enqueueElapsed, drainElapsed, collector.latencies())
+	report(params{
+		jobs:        *jobs,
+		workers:     *workers,
+		concurrency: *concurrency,
+		handlerTime: *handlerTime,
+		prefill:     *prefill,
+		enqueue:     enqueueElapsed,
+		drain:       drainElapsed,
+		total:       totalElapsed,
+	}, collector.latencies())
 }
 
-func report(jobs, workers, concurrency int, handlerTime, enqueueElapsed, drainElapsed time.Duration, lat []time.Duration) {
+type params struct {
+	jobs, workers, concurrency int
+	handlerTime                time.Duration
+	prefill                    bool
+	enqueue, drain, total      time.Duration
+}
+
+func report(p params, lat []time.Duration) {
 	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
 
-	fmt.Printf("\njobs            %d\n", jobs)
-	fmt.Printf("workers         %d x %d concurrency\n", workers, concurrency)
-	fmt.Printf("handler time    %s\n", handlerTime)
-	fmt.Printf("enqueue         %s (%.0f jobs/sec)\n", enqueueElapsed.Round(time.Millisecond), rate(jobs, enqueueElapsed))
-	fmt.Printf("drain           %s (%.0f jobs/sec)\n", drainElapsed.Round(time.Millisecond), rate(jobs, drainElapsed))
+	mode := "steady state"
+	if p.prefill {
+		mode = "backlog drain"
+	}
+
+	fmt.Printf("\nmode            %s\n", mode)
+	fmt.Printf("jobs            %d\n", p.jobs)
+	fmt.Printf("workers         %d x %d concurrency\n", p.workers, p.concurrency)
+	fmt.Printf("handler time    %s\n", p.handlerTime)
+	fmt.Printf("enqueue         %s (%.0f jobs/sec)\n", p.enqueue.Round(time.Millisecond), rate(p.jobs, p.enqueue))
+
+	if p.prefill {
+		fmt.Printf("drain           %s (%.0f jobs/sec)\n", p.drain.Round(time.Millisecond), rate(p.jobs, p.drain))
+		fmt.Printf("\nlatency not reported in this mode: every job waits out the\n")
+		fmt.Printf("enqueue phase before a worker exists, so the percentiles would\n")
+		fmt.Printf("describe the backlog rather than the queue.\n")
+		return
+	}
+
+	fmt.Printf("end to end      %s (%.0f jobs/sec sustained)\n", p.total.Round(time.Millisecond), rate(p.jobs, p.total))
 
 	if len(lat) > 0 {
-		fmt.Printf("\nend-to-end latency (enqueue to ack)\n")
+		fmt.Printf("\nlatency, enqueue to ack\n")
 		fmt.Printf("  p50           %s\n", percentile(lat, 0.50).Round(time.Microsecond))
 		fmt.Printf("  p95           %s\n", percentile(lat, 0.95).Round(time.Microsecond))
 		fmt.Printf("  p99           %s\n", percentile(lat, 0.99).Round(time.Microsecond))

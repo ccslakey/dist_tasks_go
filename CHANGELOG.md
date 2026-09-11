@@ -84,7 +84,15 @@ misconfiguration still does.
 - `internal/testredis` fails instead of skipping when `DTQ_REQUIRE_REDIS` is
   set. CI sets it, because a skipped integration suite looks identical to a
   passing one.
-- `cmd/loadtest` reports drain throughput and end-to-end latency percentiles.
+- `cmd/loadtest` reports throughput and end-to-end latency. It has two modes:
+  steady state starts the workers before the first job arrives, so the latency
+  percentiles measure queue overhead, and `-prefill` builds a backlog first to
+  find peak drain throughput, which makes per-job latency meaningless and so
+  suppresses it. Measured 25,204 jobs/sec draining a backlog and a 6.6ms p99 in
+  steady state, 4 workers at 32 concurrency against one local Redis.
+- `internal/testredis` probes with a plain TCP dial before handing the address
+  to go-redis, so a missing Redis reports once instead of retrying the dial and
+  logging several lines per test.
 - `go.mod`: direct dependencies are no longer all marked `// indirect`, the
   module path is `github.com/ccslakey/dist_tasks_go` so the repo is
   go-gettable, and the Go directive is 1.24 (nothing required 1.26 once
