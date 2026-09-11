@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build *)",
+      "Bash(mv /Users/connorslakey/dist_tasks_go/redisstream/backend.go /Users/connorslakey/dist_tasks_go/redisstream/store.go)",
+      "Bash(mv /Users/connorslakey/dist_tasks_go/redisstream/backend_test.go /Users/connorslakey/dist_tasks_go/redisstream/store_test.go)",
+      "Bash(go version *)",
+      "Bash(go doc *)",
+      "Bash(go test *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(go get *)"
+    ]
+  }
+}
