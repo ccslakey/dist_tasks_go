@@ -5,7 +5,7 @@ import (
 	"errors"
 	"log/slog"
 
-	"dist_tasks_go/queue"
+	"github.com/ccslakey/dist_tasks_go/queue"
 )
 
 // PermanentFail always returns a permanent error, sending the job straight to

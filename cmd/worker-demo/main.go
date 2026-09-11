@@ -2,11 +2,6 @@ package main
 
 import (
 	"context"
-	"dist_tasks_go/examples/tasks"
-	"dist_tasks_go/internal/prettylog"
-	"dist_tasks_go/prommetrics"
-	"dist_tasks_go/queue"
-	"dist_tasks_go/redisstream"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -16,6 +11,12 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/ccslakey/dist_tasks_go/examples/tasks"
+	"github.com/ccslakey/dist_tasks_go/internal/prettylog"
+	"github.com/ccslakey/dist_tasks_go/prommetrics"
+	"github.com/ccslakey/dist_tasks_go/queue"
+	"github.com/ccslakey/dist_tasks_go/redisstream"
 )
 
 func main() {

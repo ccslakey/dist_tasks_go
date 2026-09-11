@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"time"
 
-	"dist_tasks_go/queue"
+	"github.com/ccslakey/dist_tasks_go/queue"
 )
 
 type ImagePayload struct {

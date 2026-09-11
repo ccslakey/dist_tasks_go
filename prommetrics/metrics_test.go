@@ -3,7 +3,7 @@ package prommetrics
 import (
 	"testing"
 
-	"dist_tasks_go/queue"
+	"github.com/ccslakey/dist_tasks_go/queue"
 
 	"github.com/prometheus/client_golang/prometheus"
 )

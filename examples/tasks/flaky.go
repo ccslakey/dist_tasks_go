@@ -5,7 +5,7 @@ import (
 	"errors"
 	"log/slog"
 
-	"dist_tasks_go/queue"
+	"github.com/ccslakey/dist_tasks_go/queue"
 )
 
 // FlakyEmail fails with a retryable error on the first two attempts and

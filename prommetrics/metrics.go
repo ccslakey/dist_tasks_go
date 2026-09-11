@@ -10,7 +10,7 @@ package prommetrics
 
 import (
 	"context"
-	"dist_tasks_go/queue"
+	"github.com/ccslakey/dist_tasks_go/queue"
 	"sync"
 	"time"
 
