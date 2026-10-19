@@ -21,16 +21,17 @@ import (
 // The queue can't do this for you: once a side effect leaves the process, only
 // the system receiving it can refuse a duplicate.
 type downstream struct {
-	rdb    *redis.Client
+	rdb    redis.UniversalClient
 	prefix string
 }
 
+// keys share the {ds} hash tag so the scripts can use them all on a cluster.
 func (d downstream) keys() []string {
 	return []string{
-		d.prefix + "ds:fence",    // job ID -> highest fencing token seen
-		d.prefix + "ds:outcomes", // outcome -> count
-		d.prefix + "ds:applied",  // job ID -> payload n, once applied
-		d.prefix + "ds:effects",  // payload n -> effects applied (must end at 1)
+		d.prefix + "{ds}:fence",    // job ID -> highest fencing token seen
+		d.prefix + "{ds}:outcomes", // outcome -> count
+		d.prefix + "{ds}:applied",  // job ID -> payload n, once applied
+		d.prefix + "{ds}:effects",  // payload n -> effects applied (must end at 1)
 	}
 }
 

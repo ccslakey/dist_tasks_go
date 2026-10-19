@@ -1,6 +1,7 @@
 package redisstream
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
@@ -9,6 +10,8 @@ import (
 
 	"dist_tasks_go/internal/testredis"
 	"dist_tasks_go/queue"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // newTestSharded returns a sharded queue on the test Redis, or on the Redis
@@ -38,16 +41,19 @@ func newTestSharded(t *testing.T, partitions int) *Sharded {
 	return s
 }
 
-// cleanupCluster deletes a test's keys, since FLUSHDB only reaches one node.
+// cleanupCluster deletes a test's keys from every node.
 func cleanupCluster(t *testing.T, config ShardedConfig) {
-	s, err := NewSharded(ShardedConfig{Addrs: config.Addrs, Cluster: true, Partitions: config.Partitions, Prefix: config.Prefix})
+	client := redis.NewClusterClient(&redis.ClusterOptions{Addrs: config.Addrs})
+	defer client.Close()
+	err := client.ForEachMaster(context.Background(), func(ctx context.Context, node *redis.Client) error {
+		iter := node.Scan(ctx, 0, config.Prefix+":*", 1000).Iterator()
+		for iter.Next(ctx) {
+			node.Del(ctx, iter.Val())
+		}
+		return iter.Err()
+	})
 	if err != nil {
-		return
-	}
-	defer s.Close()
-	for _, part := range s.parts {
-		c := part.config
-		s.client.Del(t.Context(), c.Stream, c.RetryKey, part.retryData, c.DeadLetter)
+		t.Logf("cleaning up cluster keys: %v", err)
 	}
 }
 

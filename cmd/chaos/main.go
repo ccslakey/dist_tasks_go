@@ -37,6 +37,7 @@ import (
 	"syscall"
 	"time"
 
+	"dist_tasks_go/internal/redisutil"
 	"dist_tasks_go/queue"
 	"dist_tasks_go/redisstream"
 
@@ -44,7 +45,7 @@ import (
 )
 
 type options struct {
-	redisAddr   string
+	target      redisutil.Target
 	prefix      string
 	jobs        int
 	workers     int
@@ -77,7 +78,7 @@ const (
 
 func main() {
 	var o options
-	flag.StringVar(&o.redisAddr, "redis", "localhost:6379", "Redis address")
+	o.target.RegisterFlags(flag.CommandLine)
 	flag.IntVar(&o.jobs, "jobs", 10000, "jobs to enqueue")
 	flag.IntVar(&o.workers, "workers", 4, "worker processes to keep running")
 	flag.IntVar(&o.concurrency, "concurrency", 8, "concurrency per worker")
@@ -104,16 +105,10 @@ func main() {
 	os.Exit(runController(o))
 }
 
-func storeConfig(o options) redisstream.Config {
-	return redisstream.Config{
-		Addr:                o.redisAddr,
-		Stream:              o.prefix + "jobs",
-		Group:               o.prefix + "workers",
-		RetryKey:            o.prefix + "retry",
-		DeadLetter:          o.prefix + "dead",
-		DedupePrefix:        o.prefix + "dedupe:",
-		ConsumerIdleTimeout: 10 * time.Second,
-	}
+// openBackend opens the run's queue and returns the configs of its streams
+// (one per partition), for inspecting them directly.
+func openBackend(o options) (redisutil.Backend, []redisstream.Config, error) {
+	return o.target.Open(o.prefix, 10*time.Second)
 }
 
 // Ledger keys. Handlers append one entry per run that reaches its side effect:
@@ -132,11 +127,12 @@ func runWorker(o options) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	store, err := redisstream.New(storeConfig(o))
+	store, _, err := openBackend(o)
 	if err != nil {
 		return err
 	}
-	rdb := redis.NewClient(&redis.Options{Addr: o.redisAddr})
+	defer store.Close()
+	rdb := o.target.Client()
 
 	w := queue.NewWorker(store, queue.WorkerConfig{
 		ID:                o.workerID,
@@ -193,7 +189,7 @@ func runWorker(o options) error {
 // report how many zombie results were rejected.
 type leaseLostCounter struct {
 	queue.NoopMetrics
-	rdb *redis.Client
+	rdb redis.UniversalClient
 	key string
 }
 
@@ -212,10 +208,11 @@ type proc struct {
 }
 
 type controller struct {
-	o    options
-	exe  string
-	rng  *rand.Rand
-	next int
+	o     options
+	exe   string
+	parts []redisstream.Config // the queue's streams, one per partition
+	rng   *rand.Rand
+	next  int
 
 	mu      sync.Mutex
 	procs   []*proc
@@ -233,20 +230,25 @@ func runController(o options) int {
 	if err != nil {
 		log.Fatal(err)
 	}
-	rdb := redis.NewClient(&redis.Options{Addr: o.redisAddr})
+	rdb := o.target.Client()
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("redis unavailable at %s: %v", o.redisAddr, err)
+		log.Fatalf("redis unavailable (%s): %v", o.target, err)
 	}
-	store, err := redisstream.New(storeConfig(o))
+	store, parts, err := openBackend(o)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer store.Close()
 	if !o.keep {
-		defer cleanup(rdb, o.prefix)
+		defer func() {
+			if err := redisutil.DeletePrefix(context.Background(), rdb, o.prefix); err != nil {
+				log.Printf("cleanup: %v", err)
+			}
+		}()
 	}
 
 	fmt.Printf("chaos run %s\n", strings.TrimSuffix(o.prefix, ":"))
+	fmt.Printf("  %s\n", o.target)
 	fmt.Printf("  %d jobs, %d workers x %d, visibility %s, fail rate %.0f%%\n",
 		o.jobs, o.workers, o.concurrency, o.visibility, o.failRate*100)
 
@@ -274,7 +276,7 @@ func runController(o options) int {
 		}
 	}
 
-	c := &controller{o: o, exe: exe, rng: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))}
+	c := &controller{o: o, exe: exe, parts: parts, rng: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))}
 	start := time.Now()
 	for range o.workers {
 		c.spawn()
@@ -306,10 +308,11 @@ func (c *controller) spawn() {
 	c.next++
 	id := fmt.Sprintf("chaos-worker-%d", c.next)
 	o := c.o
-	cmd := exec.Command(c.exe,
-		"-worker", "-worker-id", id, "-prefix", o.prefix, "-redis", o.redisAddr,
+	args := append([]string{"-worker", "-worker-id", id, "-prefix", o.prefix,
 		"-concurrency", strconv.Itoa(o.concurrency), "-visibility", o.visibility.String(),
-		"-fail-rate", strconv.FormatFloat(o.failRate, 'f', -1, 64), "-v="+strconv.FormatBool(o.verbose))
+		"-fail-rate", strconv.FormatFloat(o.failRate, 'f', -1, 64), "-v=" + strconv.FormatBool(o.verbose)},
+		o.target.Args()...)
+	cmd := exec.Command(c.exe, args...)
 	if o.verbose {
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	}
@@ -434,7 +437,7 @@ func (c *controller) stopAll() {
 	}
 }
 
-func (c *controller) report(ctx context.Context, rdb *redis.Client, store *redisstream.Store, elapsed time.Duration) int {
+func (c *controller) report(ctx context.Context, rdb redis.UniversalClient, store queue.Backend, elapsed time.Duration) int {
 	type execution struct{ start, end int64 }
 	executions := map[int][]execution{}
 	ledger, err := rdb.LRange(ctx, ledgerKey(c.o.prefix), 0, -1).Result()
@@ -452,9 +455,13 @@ func (c *controller) report(ctx context.Context, rdb *redis.Client, store *redis
 	}
 
 	deadReason := map[int]string{}
-	dead, err := rdb.XRange(ctx, c.o.prefix+"dead", "-", "+").Result()
-	if err != nil {
-		log.Fatalf("read dead-letter stream: %v", err)
+	var dead []redis.XMessage
+	for _, part := range c.parts {
+		msgs, err := rdb.XRange(ctx, part.DeadLetter, "-", "+").Result()
+		if err != nil {
+			log.Fatalf("read dead-letter stream: %v", err)
+		}
+		dead = append(dead, msgs...)
 	}
 	for _, m := range dead {
 		var p payload
@@ -502,7 +509,7 @@ func (c *controller) report(ctx context.Context, rdb *redis.Client, store *redis
 	// Every job that wasn't dead-lettered must have had its effect applied
 	// exactly once; a dead-lettered one at most once.
 	effects := map[int]int{}
-	raw, err := rdb.HGetAll(ctx, c.o.prefix+"ds:effects").Result()
+	raw, err := rdb.HGetAll(ctx, downstream{prefix: c.o.prefix}.keys()[3]).Result()
 	if err != nil {
 		log.Fatalf("read effects: %v", err)
 	}
@@ -520,8 +527,14 @@ func (c *controller) report(ctx context.Context, rdb *redis.Client, store *redis
 			missingEffects = append(missingEffects, id)
 		}
 	}
-	outcomes, _ := rdb.HGetAll(ctx, c.o.prefix+"ds:outcomes").Result()
-	consumers, _ := rdb.XInfoConsumers(ctx, c.o.prefix+"jobs", c.o.prefix+"workers").Result()
+	outcomes, _ := rdb.HGetAll(ctx, downstream{prefix: c.o.prefix}.keys()[1]).Result()
+	consumers := map[string]bool{} // distinct across partitions
+	for _, part := range c.parts {
+		infos, _ := rdb.XInfoConsumers(ctx, part.Stream, part.Group).Result()
+		for _, info := range infos {
+			consumers[info.Name] = true
+		}
+	}
 
 	st, _ := store.Stats(ctx)
 	leaseLost, _ := rdb.Get(ctx, leaseLostKey(c.o.prefix)).Int()
@@ -577,13 +590,17 @@ func (c *controller) report(ctx context.Context, rdb *redis.Client, store *redis
 
 // printPending shows who holds each unsettled delivery, to tell a job that is
 // still being heartbeated apart from one that recovery never reaches.
-func (c *controller) printPending(ctx context.Context, rdb *redis.Client) {
-	pending, err := rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
-		Stream: c.o.prefix + "jobs", Group: c.o.prefix + "workers", Start: "-", End: "+", Count: 20,
-	}).Result()
-	if err != nil {
-		fmt.Printf("  xpending: %v\n", err)
-		return
+func (c *controller) printPending(ctx context.Context, rdb redis.UniversalClient) {
+	var pending []redis.XPendingExt
+	for _, part := range c.parts {
+		got, err := rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+			Stream: part.Stream, Group: part.Group, Start: "-", End: "+", Count: 20,
+		}).Result()
+		if err != nil {
+			fmt.Printf("  xpending: %v\n", err)
+			return
+		}
+		pending = append(pending, got...)
 	}
 	c.mu.Lock()
 	live := map[string]bool{}
@@ -595,13 +612,5 @@ func (c *controller) printPending(ctx context.Context, rdb *redis.Client) {
 	for _, p := range pending {
 		fmt.Printf("    %s owner=%s (alive: %t) idle=%s deliveries=%d\n",
 			p.ID, p.Consumer, live[p.Consumer], p.Idle.Round(time.Millisecond), p.RetryCount)
-	}
-}
-
-func cleanup(rdb *redis.Client, prefix string) {
-	ctx := context.Background()
-	iter := rdb.Scan(ctx, 0, prefix+"*", 1000).Iterator()
-	for iter.Next(ctx) {
-		rdb.Del(ctx, iter.Val())
 	}
 }

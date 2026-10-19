@@ -112,6 +112,9 @@ func NewWithClient(client redis.UniversalClient, config Config) (*Store, error) 
 	}, nil
 }
 
+// Config returns the store's configuration, with defaults filled in.
+func (b *Store) Config() Config { return b.config }
+
 func (b *Store) Close() error {
 	if !b.ownsClient {
 		return nil

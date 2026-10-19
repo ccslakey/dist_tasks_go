@@ -12,6 +12,8 @@
 //
 //     go run ./cmd/bench
 //     go run ./cmd/bench -workers 1,4,8 -jobs 200000 -modes block
+//     go run ./cmd/bench -modes block -workers 8 -concurrency 256 -partitions 8
+//     go run ./cmd/bench -modes block -workers 8 -concurrency 256 -cluster 127.0.0.1:30001,127.0.0.1:30002,127.0.0.1:30003
 package main
 
 import (
@@ -32,14 +34,14 @@ import (
 	"syscall"
 	"time"
 
+	"dist_tasks_go/internal/redisutil"
 	"dist_tasks_go/queue"
-	"dist_tasks_go/redisstream"
 
 	"github.com/redis/go-redis/v9"
 )
 
 type options struct {
-	redisAddr    string
+	target       redisutil.Target
 	jobs         int
 	workers      []int
 	concurrency  int
@@ -61,7 +63,7 @@ type options struct {
 func main() {
 	var o options
 	var workers, modes string
-	flag.StringVar(&o.redisAddr, "redis", "localhost:6379", "Redis address")
+	o.target.RegisterFlags(flag.CommandLine)
 	flag.IntVar(&o.jobs, "jobs", 100000, "backlog size for the throughput test")
 	flag.StringVar(&workers, "workers", "1,2,4,8", "comma-separated worker process counts to test")
 	flag.IntVar(&o.concurrency, "concurrency", 16, "concurrency per worker")
@@ -94,17 +96,17 @@ func main() {
 		o.workers = append(o.workers, n)
 	}
 	o.modes = strings.Split(modes, ",")
-	rdb := redis.NewClient(&redis.Options{Addr: o.redisAddr})
+	rdb := o.target.Client()
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		log.Fatalf("redis unavailable at %s: %v", o.redisAddr, err)
+		log.Fatalf("redis unavailable (%s): %v", o.target, err)
 	}
 	exe, err := os.Executable()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("%d jobs, concurrency %d per worker process, enqueue batches of %d, poll interval %s, latency test at %d jobs/s\n\n",
-		o.jobs, o.concurrency, o.enqueueBatch, o.pollInterval, o.rate)
+	fmt.Printf("%s: %d jobs, concurrency %d per worker process, enqueue batches of %d, poll interval %s, latency test at %d jobs/s\n\n",
+		o.target, o.jobs, o.concurrency, o.enqueueBatch, o.pollInterval, o.rate)
 	fmt.Println("| mode | workers | throughput (jobs/s) | redis cpu | enqueue (jobs/s) | pickup p50 | pickup p95 | pickup p99 |")
 	fmt.Println("|---|---|---|---|---|---|---|---|")
 	for _, mode := range o.modes {
@@ -112,20 +114,18 @@ func main() {
 			c := &controller{o: o, rdb: rdb, exe: exe, mode: mode, workers: w}
 			t := c.throughput()
 			p50, p95, p99 := (&controller{o: o, rdb: rdb, exe: exe, mode: mode, workers: w}).latency()
-			fmt.Printf("| %s | %d | %s | %.0f%% | %s | %s | %s | %s |\n", mode, w, commas(int(t.jobsPerSec)),
-				t.redisBusy*100, commas(int(t.enqueuePerSec)), ms(p50), ms(p95), ms(p99))
+			fmt.Printf("| %s | %d | %s | %s | %s | %s | %s | %s |\n", mode, w, commas(int(t.jobsPerSec)),
+				t.redisBusy, commas(int(t.enqueuePerSec)), ms(p50), ms(p95), ms(p99))
 		}
 	}
 }
 
-func storeConfig(addr, prefix string) redisstream.Config {
-	return redisstream.Config{
-		Addr:       addr,
-		Stream:     prefix + "jobs",
-		Group:      prefix + "workers",
-		RetryKey:   prefix + "retry",
-		DeadLetter: prefix + "dead",
+func openBackend(o options, prefix string) redisutil.Backend {
+	store, _, err := o.target.Open(prefix, 0)
+	if err != nil {
+		log.Fatal(err)
 	}
+	return store
 }
 
 // ---------------------------------------------------------------- worker ---
@@ -136,11 +136,9 @@ func runWorker(o options) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	store, err := redisstream.New(storeConfig(o.redisAddr, o.prefix))
-	if err != nil {
-		return err
-	}
-	rdb := redis.NewClient(&redis.Options{Addr: o.redisAddr})
+	store := openBackend(o, o.prefix)
+	defer store.Close()
+	rdb := o.target.Client()
 
 	w := queue.NewWorker(store, queue.WorkerConfig{
 		ID:           o.workerID,
@@ -175,7 +173,7 @@ func runWorker(o options) error {
 
 type controller struct {
 	o       options
-	rdb     *redis.Client
+	rdb     redis.UniversalClient
 	exe     string
 	mode    string
 	workers int
@@ -186,16 +184,17 @@ type controller struct {
 type throughputResult struct {
 	jobsPerSec    float64
 	enqueuePerSec float64
-	redisBusy     float64 // fraction of wall time Redis was on CPU
+	redisBusy     string // how busy Redis was: share of one core, summed over nodes
 }
 
 func (c *controller) start(latency bool) {
 	c.prefix = fmt.Sprintf("bench:%d:", time.Now().UnixNano())
 	for i := range c.workers {
-		cmd := exec.Command(c.exe, "-worker", "-worker-id", fmt.Sprintf("bench-%d", i),
-			"-prefix", c.prefix, "-redis", c.o.redisAddr, "-mode", c.mode,
+		args := append([]string{"-worker", "-worker-id", fmt.Sprintf("bench-%d", i),
+			"-prefix", c.prefix, "-mode", c.mode,
 			"-concurrency", strconv.Itoa(c.o.concurrency), "-poll", c.o.pollInterval.String(),
-			"-latency="+strconv.FormatBool(latency))
+			"-latency=" + strconv.FormatBool(latency)}, c.o.target.Args()...)
+		cmd := exec.Command(c.exe, args...)
 		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
 			log.Fatalf("start worker: %v", err)
@@ -224,14 +223,12 @@ func (c *controller) stop() {
 	for _, p := range c.procs {
 		p.Wait()
 	}
-	ctx := context.Background()
-	iter := c.rdb.Scan(ctx, 0, c.prefix+"*", 1000).Iterator()
-	for iter.Next(ctx) {
-		c.rdb.Del(ctx, iter.Val())
+	if err := redisutil.DeletePrefix(context.Background(), c.rdb, c.prefix); err != nil {
+		log.Printf("cleanup: %v", err)
 	}
 }
 
-func (c *controller) enqueue(store *redisstream.Store, n int) time.Duration {
+func (c *controller) enqueue(store queue.Backend, n int) time.Duration {
 	q := queue.New(store)
 	start := time.Now()
 	var wg sync.WaitGroup
@@ -249,7 +246,7 @@ func (c *controller) enqueue(store *redisstream.Store, n int) time.Duration {
 }
 
 // enqueueBatched builds the backlog with EnqueueBatch calls.
-func (c *controller) enqueueBatched(store *redisstream.Store, n int) time.Duration {
+func (c *controller) enqueueBatched(store queue.Backend, n int) time.Duration {
 	q := queue.New(store)
 	start := time.Now()
 	var wg sync.WaitGroup
@@ -280,10 +277,7 @@ func (c *controller) enqueueBatched(store *redisstream.Store, n int) time.Durati
 func (c *controller) throughput() throughputResult {
 	c.start(false)
 	defer c.stop()
-	store, err := redisstream.New(storeConfig(c.o.redisAddr, c.prefix))
-	if err != nil {
-		log.Fatal(err)
-	}
+	store := openBackend(c.o, c.prefix)
 	defer store.Close()
 
 	enqueue := c.enqueueBatched
@@ -291,7 +285,7 @@ func (c *controller) throughput() throughputResult {
 		enqueue = c.enqueue
 	}
 	enqueueTime := enqueue(store, c.o.jobs)
-	cpuBefore := redisCPU(c.rdb)
+	cpuBefore := redisutil.CPUSeconds(context.Background(), c.rdb)
 	start := time.Now()
 	c.release()
 	for {
@@ -299,23 +293,35 @@ func (c *controller) throughput() throughputResult {
 		if err == nil && st.StreamLength == 0 && st.InFlight == 0 {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 	elapsed := time.Since(start)
 	return throughputResult{
 		jobsPerSec:    float64(c.o.jobs) / elapsed.Seconds(),
 		enqueuePerSec: float64(c.o.jobs) / enqueueTime.Seconds(),
-		redisBusy:     (redisCPU(c.rdb) - cpuBefore) / elapsed.Seconds(),
+		redisBusy:     busy(cpuBefore, redisutil.CPUSeconds(context.Background(), c.rdb), elapsed),
 	}
+}
+
+// busy formats how much CPU Redis used over elapsed, as a share of one
+// core: the total, and for a cluster the busiest node.
+func busy(before, after map[string]float64, elapsed time.Duration) string {
+	var total, busiest float64
+	for node, cpu := range after {
+		share := (cpu - before[node]) / elapsed.Seconds()
+		total += share
+		busiest = max(busiest, share)
+	}
+	if len(after) == 1 {
+		return fmt.Sprintf("%.0f%%", total*100)
+	}
+	return fmt.Sprintf("%.0f%% (%d nodes, busiest %.0f%%)", total*100, len(after), busiest*100)
 }
 
 func (c *controller) latency() (p50, p95, p99 time.Duration) {
 	c.start(true)
 	defer c.stop()
-	store, err := redisstream.New(storeConfig(c.o.redisAddr, c.prefix))
-	if err != nil {
-		log.Fatal(err)
-	}
+	store := openBackend(c.o, c.prefix)
 	defer store.Close()
 	c.release()
 	time.Sleep(300 * time.Millisecond) // let workers settle into their idle loop
@@ -346,23 +352,6 @@ func (c *controller) latency() (p50, p95, p99 time.Duration) {
 	slices.Sort(waits)
 	at := func(p float64) time.Duration { return waits[int(p*float64(len(waits)-1))] }
 	return at(0.50), at(0.95), at(0.99)
-}
-
-// redisCPU returns the CPU seconds Redis has used so far.
-func redisCPU(rdb *redis.Client) float64 {
-	info, err := rdb.Info(context.Background(), "cpu").Result()
-	if err != nil {
-		return 0
-	}
-	var total float64
-	for _, line := range strings.Split(info, "\n") {
-		k, v, ok := strings.Cut(strings.TrimSpace(line), ":")
-		if ok && (k == "used_cpu_user" || k == "used_cpu_sys") {
-			f, _ := strconv.ParseFloat(v, 64)
-			total += f
-		}
-	}
-	return total
 }
 
 func ms(d time.Duration) string {
