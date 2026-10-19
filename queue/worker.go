@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -339,8 +340,8 @@ type ackRequest struct {
 	done chan error
 }
 
-// maxAckBatch caps how many acks go out in one round trip.
-const maxAckBatch = 256
+// maxBatch caps how many acks or lease renewals go out in one round trip.
+const maxBatch = 256
 
 func (w *Worker) ack(ctx context.Context, job Job) error {
 	if w.acks == nil {
@@ -364,7 +365,7 @@ func (w *Worker) ackLoop(ctx context.Context, b batchAcker, stop <-chan struct{}
 			batch = append(batch, req)
 		}
 	more:
-		for len(batch) < maxAckBatch {
+		for len(batch) < maxBatch {
 			select {
 			case req := <-w.acks:
 				batch = append(batch, req)
@@ -393,17 +394,45 @@ func (w *Worker) heartbeat(ctx context.Context, running *sync.Map, stop <-chan s
 			return
 		case <-ticker.C:
 		}
+		var held []*runningJob
 		running.Range(func(_, v any) bool {
-			rj := v.(*runningJob)
-			err := w.backend.Extend(ctx, rj.job)
-			if errors.Is(err, ErrLeaseLost) {
-				rj.cancel(ErrLeaseLost)
-			} else if err != nil {
-				slog.Warn("renewing lease failed", "worker", w.config.ID, "job_id", rj.job.ID, "err", err)
-			}
+			held = append(held, v.(*runningJob))
 			return true
 		})
+		for batch := range slices.Chunk(held, maxBatch) {
+			for i, err := range w.extend(ctx, batch) {
+				rj := batch[i]
+				if errors.Is(err, ErrLeaseLost) {
+					rj.cancel(ErrLeaseLost)
+				} else if err != nil {
+					slog.Warn("renewing lease failed", "worker", w.config.ID, "job_id", rj.job.ID, "err", err)
+				}
+			}
+		}
 	}
+}
+
+// batchExtender is implemented by backends that can renew many leases in
+// one round trip. It returns one error per job.
+type batchExtender interface {
+	ExtendBatch(ctx context.Context, jobs []Job) []error
+}
+
+// extend renews the leases of running jobs, in one call if the backend
+// supports it.
+func (w *Worker) extend(ctx context.Context, running []*runningJob) []error {
+	jobs := make([]Job, len(running))
+	for i, rj := range running {
+		jobs[i] = rj.job
+	}
+	if b, ok := w.backend.(batchExtender); ok {
+		return b.ExtendBatch(ctx, jobs)
+	}
+	errs := make([]error, len(jobs))
+	for i, job := range jobs {
+		errs[i] = w.backend.Extend(ctx, job)
+	}
+	return errs
 }
 
 func (w *Worker) reportStats(ctx context.Context) {

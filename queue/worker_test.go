@@ -107,6 +107,35 @@ func TestWorkerBoundsConcurrency(t *testing.T) {
 	}
 }
 
+func TestWorkerRenewsLeasesInBatches(t *testing.T) {
+	backend := &batchingBackend{fakeBackend: &fakeBackend{extendErr: ErrLeaseLost}}
+	for i := range 20 {
+		backend.ready = append(backend.ready, testJob(JobID(fmt.Sprint(i)), "slow"))
+	}
+	worker := NewWorker(backend, WorkerConfig{
+		ID:                "worker-1",
+		Concurrency:       20,
+		PollInterval:      time.Millisecond,
+		HeartbeatInterval: 20 * time.Millisecond,
+	}, nil)
+	var cancelled atomic.Int64
+	worker.Register("slow", func(ctx context.Context, _ Job) JobResult {
+		<-ctx.Done()
+		cancelled.Add(1)
+		return JobResult{}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	waitFor(t, func() bool { return cancelled.Load() == 20 })
+	cancel()
+	<-done
+
+	if backend.extendBatches > 2 {
+		t.Errorf("renewing 20 leases took %d calls, want them batched", backend.extendBatches)
+	}
+}
+
 func TestWorkerBatchesAcks(t *testing.T) {
 	const jobs = 50
 	backend := &batchingBackend{fakeBackend: &fakeBackend{}}
@@ -123,8 +152,22 @@ func TestWorkerBatchesAcks(t *testing.T) {
 	<-done
 }
 
-// batchingBackend adds AckBatch to fakeBackend.
-type batchingBackend struct{ *fakeBackend }
+// batchingBackend adds AckBatch and ExtendBatch to fakeBackend.
+type batchingBackend struct {
+	*fakeBackend
+	extendBatches int
+}
+
+func (b *batchingBackend) ExtendBatch(ctx context.Context, jobs []Job) []error {
+	b.mu.Lock()
+	b.extendBatches++
+	b.mu.Unlock()
+	errs := make([]error, len(jobs))
+	for i, job := range jobs {
+		errs[i] = b.Extend(ctx, job)
+	}
+	return errs
+}
 
 func (b *batchingBackend) AckBatch(ctx context.Context, jobs []Job) []error {
 	errs := make([]error, len(jobs))

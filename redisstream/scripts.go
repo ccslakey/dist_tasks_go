@@ -63,26 +63,46 @@ settle(KEYS[1])
 return 1
 `)
 
-// Moves due entries from the schedule back onto the stream. It runs as one
-// atomic step, so concurrent callers can't promote the same job twice.
+// Moves due entries from the schedule back onto the stream. Running inside a
+// script makes it one atomic step, so concurrent callers can't promote the
+// same job twice.
+const promoteLua = `
+local function promote(zset, data, stream, now, limit)
+  local ids = redis.call('ZRANGEBYSCORE', zset, '-inf', now, 'LIMIT', 0, limit)
+  for _, id in ipairs(ids) do
+    local fields_json = redis.call('HGET', data, id)
+    if fields_json then
+      local fields = {}
+      for k, v in pairs(cjson.decode(fields_json)) do
+        fields[#fields + 1] = k
+        fields[#fields + 1] = v
+      end
+      redis.call('XADD', stream, '*', unpack(fields))
+    end
+    redis.call('HDEL', data, id)
+    redis.call('ZREM', zset, id)
+  end
+  return #ids
+end
+`
+
 // KEYS[1]=schedule zset KEYS[2]=schedule data hash KEYS[3]=stream
 // ARGV[1]=now (unix ms) ARGV[2]=limit
-var promoteScript = redis.NewScript(`
-local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
-for _, id in ipairs(ids) do
-  local data = redis.call('HGET', KEYS[2], id)
-  if data then
-    local fields = {}
-    for k, v in pairs(cjson.decode(data)) do
-      fields[#fields + 1] = k
-      fields[#fields + 1] = v
-    end
-    redis.call('XADD', KEYS[3], '*', unpack(fields))
-  end
-  redis.call('HDEL', KEYS[2], id)
-  redis.call('ZREM', KEYS[1], id)
-end
-return #ids
+var promoteScript = redis.NewScript(promoteLua + `
+return promote(KEYS[1], KEYS[2], KEYS[3], ARGV[1], ARGV[2])
+`)
+
+// Promotes due retries and then claims up to ARGV[3] new entries, in one
+// round trip. XREADGROUP can't block inside a script, so callers that want to
+// wait for new jobs follow an empty result with a blocking XREADGROUP.
+// KEYS[1]=stream KEYS[2]=schedule zset KEYS[3]=schedule data hash
+// ARGV[1]=group ARGV[2]=consumer ARGV[3]=count ARGV[4]=now (unix ms)
+// Returns {{id, fields}, ...}
+var claimScript = redis.NewScript(promoteLua + `
+promote(KEYS[2], KEYS[3], KEYS[1], ARGV[4], 100)
+local res = redis.call('XREADGROUP', 'GROUP', ARGV[1], ARGV[2], 'COUNT', ARGV[3], 'STREAMS', KEYS[1], '>')
+if not res then return {} end
+return res[1][2]
 `)
 
 // Claims up to ARGV[4] deliveries that have been idle at least ARGV[3] ms and
@@ -169,6 +189,23 @@ for i = 2, #ARGV, 3 do
   if #p > 0 and p[1][2] == ARGV[i + 1] and p[1][4] == tonumber(ARGV[i + 2]) then
     redis.call('XACK', KEYS[1], ARGV[1], ARGV[i])
     redis.call('XDEL', KEYS[1], ARGV[i])
+    out[#out + 1] = 1
+  else
+    out[#out + 1] = 0
+  end
+end
+return out
+`)
+
+// Renews a batch of leases in one round trip, each fenced like extendScript.
+// KEYS[1]=stream ARGV[1]=group, then ARGV[2..] = message ID, owner, token
+// triples. Returns one 1 (renewed) or 0 (lease lost) per delivery.
+var extendBatchScript = redis.NewScript(`
+local out = {}
+for i = 2, #ARGV, 3 do
+  local p = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[i], ARGV[i], 1)
+  if #p > 0 and p[1][2] == ARGV[i + 1] and p[1][4] == tonumber(ARGV[i + 2]) then
+    redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[i + 1], 0, ARGV[i], 'JUSTID')
     out[#out + 1] = 1
   else
     out[#out + 1] = 0

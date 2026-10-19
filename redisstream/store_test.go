@@ -409,3 +409,27 @@ func TestAckBatchFencesEachJob(t *testing.T) {
 		t.Errorf("InFlight = %d, want 1 (only the stale job left)", stats.InFlight)
 	}
 }
+
+func TestExtendBatchFencesEachJob(t *testing.T) {
+	store := newTestStore(t)
+	ctx := t.Context()
+
+	current := claimOne(t, store, "worker-1")
+	stale := claimOne(t, store, "worker-1")
+	stale.Lease.Token = 99
+	const visibility = 100 * time.Millisecond
+
+	time.Sleep(2 * visibility)
+	errs := store.ExtendBatch(ctx, []queue.Job{current, stale})
+	if errs[0] != nil || !errors.Is(errs[1], queue.ErrLeaseLost) {
+		t.Fatalf("ExtendBatch errors = %v, want [nil ErrLeaseLost]", errs)
+	}
+	// Only the renewed job is safe from recovery.
+	recovered, err := store.RecoverExpired(ctx, visibility, "worker-2", 10)
+	if err != nil {
+		t.Fatalf("RecoverExpired: %v", err)
+	}
+	if len(recovered) != 1 || recovered[0].Lease.MessageID != stale.Lease.MessageID {
+		t.Errorf("recovered %v, want only the job whose lease wasn't renewed", recovered)
+	}
+}

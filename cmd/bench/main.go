@@ -5,12 +5,13 @@
 //   - Throughput: enqueue a backlog of no-op jobs, start the workers together,
 //     and time how long they take to drain it. Also reports how fast the
 //     backlog was enqueued and how busy Redis was.
+//
 //   - Latency: enqueue at a steady rate the workers can easily keep up with,
 //     and record how long each job waited between enqueue and its handler
 //     starting.
 //
-//	go run ./cmd/bench
-//	go run ./cmd/bench -workers 1,4,8 -jobs 200000 -modes block
+//     go run ./cmd/bench
+//     go run ./cmd/bench -workers 1,4,8 -jobs 200000 -modes block
 package main
 
 import (

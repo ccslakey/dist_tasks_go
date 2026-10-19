@@ -160,21 +160,36 @@ func (b *Store) schedule(ctx context.Context, job queue.Job, runAt time.Time) er
 }
 
 func (b *Store) Claim(ctx context.Context, workerID string, limit int, wait time.Duration) ([]queue.Job, error) {
-	block := time.Duration(-1) // non-blocking; go-redis treats 0 as BLOCK 0 (block forever)
-	if wait > 0 {
-		block = wait
+	// Promote due retries and claim what's ready in one round trip.
+	res, err := claimScript.Run(ctx, b.rds,
+		[]string{b.config.Stream, b.config.RetryKey, b.retryData},
+		b.config.Group, workerID, limit, time.Now().UnixMilli()).Slice()
+	if err != nil {
+		return nil, fmt.Errorf("claim: %w", err)
 	}
-	// Promote any due retries first so they're visible to this XREADGROUP call.
-	if _, err := b.promoteRetries(ctx, 100); err != nil {
-		return nil, fmt.Errorf("promote retries: %w", err)
+	var jobs []queue.Job
+	for _, e := range res {
+		entry, ok := e.([]any)
+		if !ok || len(entry) != 2 {
+			return nil, fmt.Errorf("claim: unexpected entry %v", e)
+		}
+		id, _ := entry[0].(string)
+		// A fresh delivery always has delivery count 1.
+		if job, ok := b.parseOrQuarantine(ctx, id, flatToMap(entry[1]), queue.Lease{MessageID: id, Owner: workerID, Token: 1}); ok {
+			jobs = append(jobs, job)
+		}
+	}
+	if len(res) > 0 || wait <= 0 {
+		return jobs, nil
 	}
 
+	// Nothing was ready: block until a new entry arrives or wait elapses.
 	streams, err := b.rds.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    b.config.Group,
 		Consumer: workerID,
 		Count:    int64(limit),
 		Streams:  []string{b.config.Stream, ">"},
-		Block:    block,
+		Block:    wait,
 	}).Result()
 	if err == redis.Nil {
 		return nil, nil
@@ -183,7 +198,6 @@ func (b *Store) Claim(ctx context.Context, workerID string, limit int, wait time
 		return nil, fmt.Errorf("xreadgroup for %s: %w", workerID, err)
 	}
 
-	var jobs []queue.Job
 	for _, s := range streams {
 		for _, msg := range s.Messages {
 			// A fresh delivery always has delivery count 1.
@@ -194,6 +208,17 @@ func (b *Store) Claim(ctx context.Context, workerID string, limit int, wait time
 		}
 	}
 	return jobs, nil
+}
+
+// flatToMap converts a script's [field, value, ...] reply into a map.
+func flatToMap(v any) map[string]any {
+	flat, _ := v.([]any)
+	vals := make(map[string]any, len(flat)/2)
+	for i := 0; i+1 < len(flat); i += 2 {
+		k, _ := flat[i].(string)
+		vals[k] = flat[i+1]
+	}
+	return vals
 }
 
 // parseOrQuarantine parses a delivered entry. An entry that can't be parsed
@@ -290,12 +315,22 @@ func (b *Store) Ack(ctx context.Context, job queue.Job) error {
 // AckBatch acks several jobs in one round trip. The result has one entry
 // per job: nil, ErrLeaseLost, or the error that failed the whole batch.
 func (b *Store) AckBatch(ctx context.Context, jobs []queue.Job) []error {
+	return b.fencedBatch(ctx, ackBatchScript, jobs)
+}
+
+// ExtendBatch renews several leases in one round trip, with results like
+// AckBatch.
+func (b *Store) ExtendBatch(ctx context.Context, jobs []queue.Job) []error {
+	return b.fencedBatch(ctx, extendBatchScript, jobs)
+}
+
+func (b *Store) fencedBatch(ctx context.Context, script *redis.Script, jobs []queue.Job) []error {
 	args := []any{b.config.Group}
 	for _, job := range jobs {
 		args = append(args, job.Lease.MessageID, job.Lease.Owner, job.Lease.Token)
 	}
 	errs := make([]error, len(jobs))
-	res, err := ackBatchScript.Run(ctx, b.rds, []string{b.config.Stream}, args...).Int64Slice()
+	res, err := script.Run(ctx, b.rds, []string{b.config.Stream}, args...).Int64Slice()
 	for i := range jobs {
 		switch {
 		case err != nil:
@@ -375,14 +410,8 @@ func (b *Store) RecoverExpired(ctx context.Context, visibilityTimeout time.Durat
 			return nil, fmt.Errorf("recover: unexpected entry %v", e)
 		}
 		id, _ := entry[0].(string)
-		flat, _ := entry[1].([]any)
 		token, _ := entry[2].(int64)
-		vals := make(map[string]any, len(flat)/2)
-		for i := 0; i+1 < len(flat); i += 2 {
-			k, _ := flat[i].(string)
-			vals[k] = flat[i+1]
-		}
-		if job, ok := b.parseOrQuarantine(ctx, id, vals, queue.Lease{MessageID: id, Owner: workerID, Token: token}); ok {
+		if job, ok := b.parseOrQuarantine(ctx, id, flatToMap(entry[1]), queue.Lease{MessageID: id, Owner: workerID, Token: token}); ok {
 			jobs = append(jobs, job)
 		}
 	}
