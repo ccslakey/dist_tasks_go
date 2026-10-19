@@ -21,14 +21,30 @@ func TestWorkerRegisterRejectsInvalidHandlers(t *testing.T) {
 	}
 }
 
-func TestWorkerDeadLettersUnknownTask(t *testing.T) {
+// A worker without a handler leaves the job for another worker (one that may
+// have it, mid rolling deploy) and only dead-letters it at MaxDeliveries, so
+// it can't sit pending forever either.
+func TestWorkerLeavesUnknownTaskForAnotherWorker(t *testing.T) {
 	backend := &fakeBackend{}
-	worker := NewWorker(backend, WorkerConfig{ID: "worker-1"}, nil)
-	if err := worker.handleOne(t.Context(), testJob("job-1", "missing")); err != nil {
-		t.Fatalf("handleOne: %v", err)
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", MaxDeliveries: 3}, nil)
+
+	job := testJob("job-1", "missing")
+	for token := int64(1); token < 3; token++ {
+		job.Lease.Token = token
+		if err := worker.handleOne(t.Context(), job); !errors.Is(err, ErrUnknownTask) {
+			t.Fatalf("delivery %d: got %v, want ErrUnknownTask", token, err)
+		}
+		if len(backend.deadLettered()) != 0 || backend.ackedCount() != 0 {
+			t.Fatalf("delivery %d settled the job; it should be left for another worker", token)
+		}
+	}
+
+	job.Lease.Token = 3
+	if err := worker.handleOne(t.Context(), job); err != nil {
+		t.Fatalf("delivery 3: %v", err)
 	}
 	if _, ok := backend.deadLettered()["job-1"]; !ok {
-		t.Fatal("unknown task was not dead-lettered")
+		t.Fatal("unknown task not dead-lettered at MaxDeliveries")
 	}
 }
 
