@@ -20,6 +20,9 @@ type Config struct {
 	Group      string
 	RetryKey   string // sorted set of scheduled job IDs (retries and delayed jobs), scored by run-at unix ms
 	DeadLetter string
+	// ConsumerIdleTimeout is how long a consumer can hold nothing and go
+	// without reading before it's removed from the group. Defaults to 1h.
+	ConsumerIdleTimeout time.Duration
 }
 
 type Store struct {
@@ -31,6 +34,7 @@ type Store struct {
 	// recoverCursor is where the next RecoverExpired scan resumes in the PEL.
 	mu            sync.Mutex
 	recoverCursor string
+	lastPrune     time.Time
 }
 
 func New(config Config) (*Store, error) {
@@ -48,6 +52,9 @@ func New(config Config) (*Store, error) {
 	}
 	if config.DeadLetter == "" {
 		config.DeadLetter = "dtq:dead"
+	}
+	if config.ConsumerIdleTimeout <= 0 {
+		config.ConsumerIdleTimeout = time.Hour
 	}
 	rdsCli := redis.NewClient(&redis.Options{
 		Addr:     config.Addr,
@@ -283,7 +290,17 @@ func (b *Store) RecoverExpired(ctx context.Context, visibilityTimeout time.Durat
 	}
 	b.mu.Lock()
 	cursor := b.recoverCursor
+	prune := time.Since(b.lastPrune) >= min(time.Minute, b.config.ConsumerIdleTimeout/2)
+	if prune {
+		b.lastPrune = time.Now()
+	}
 	b.mu.Unlock()
+
+	if prune {
+		if err := b.pruneConsumers(ctx); err != nil {
+			slog.Warn("pruning idle consumers failed", "err", err)
+		}
+	}
 
 	res, err := recoverScript.Run(ctx, b.rds, []string{b.config.Stream},
 		b.config.Group, workerID, visibilityTimeout.Milliseconds(), limit, cursor).Slice()
@@ -320,6 +337,19 @@ func (b *Store) RecoverExpired(ctx context.Context, visibilityTimeout time.Durat
 		}
 	}
 	return jobs, nil
+}
+
+// Deregister removes workerID's consumer from the group, unless it still
+// holds pending entries (those must stay recoverable). Workers call it on a
+// clean shutdown.
+func (b *Store) Deregister(ctx context.Context, workerID string) error {
+	return deregisterScript.Run(ctx, b.rds, []string{b.config.Stream}, b.config.Group, workerID).Err()
+}
+
+// pruneConsumers removes consumers left behind by workers that crashed.
+func (b *Store) pruneConsumers(ctx context.Context) error {
+	return pruneConsumersScript.Run(ctx, b.rds, []string{b.config.Stream},
+		b.config.Group, b.config.ConsumerIdleTimeout.Milliseconds()).Err()
 }
 
 // promoteRetries atomically moves schedule entries that are due back onto the

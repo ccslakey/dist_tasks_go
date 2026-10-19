@@ -297,3 +297,38 @@ func TestMalformedEntryIsDeadLettered(t *testing.T) {
 		t.Errorf("DeadLetterDepth=%d InFlight=%d, want 1 and 1", stats.DeadLetterDepth, stats.InFlight)
 	}
 }
+
+func TestConsumerCleanupKeepsConsumersWithPendingJobs(t *testing.T) {
+	store := newTestStore(t)
+	ctx := t.Context()
+
+	held := claimOne(t, store, "busy")
+	if _, err := store.Claim(ctx, "idle", 10); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := store.Deregister(ctx, "busy"); err != nil {
+		t.Fatalf("Deregister: %v", err)
+	}
+	store.config.ConsumerIdleTimeout = time.Millisecond
+	time.Sleep(5 * time.Millisecond)
+	if err := store.pruneConsumers(ctx); err != nil {
+		t.Fatalf("pruneConsumers: %v", err)
+	}
+
+	consumers, err := store.rds.XInfoConsumers(ctx, store.config.Stream, store.config.Group).Result()
+	if err != nil {
+		t.Fatalf("XInfoConsumers: %v", err)
+	}
+	if len(consumers) != 1 || consumers[0].Name != "busy" {
+		t.Fatalf("consumers = %+v, want only busy (it holds a pending job)", consumers)
+	}
+	if err := store.Ack(ctx, held); err != nil {
+		t.Fatalf("Ack after cleanup: %v", err)
+	}
+	if err := store.Deregister(ctx, "busy"); err != nil {
+		t.Fatalf("Deregister: %v", err)
+	}
+	if consumers, _ := store.rds.XInfoConsumers(ctx, store.config.Stream, store.config.Group).Result(); len(consumers) != 0 {
+		t.Errorf("consumers after deregistering an empty one = %+v, want none", consumers)
+	}
+}

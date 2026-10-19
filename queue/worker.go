@@ -191,7 +191,19 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 	close(stopHeartbeat)
 	background.Wait()
+
+	if d, ok := w.backend.(deregisterer); ok {
+		if err := d.Deregister(context.WithoutCancel(ctx), w.config.ID); err != nil {
+			slog.Warn("deregistering worker failed", "worker", w.config.ID, "err", err)
+		}
+	}
 	return ctx.Err()
+}
+
+// deregisterer is implemented by backends that track workers and can forget
+// one after a clean shutdown.
+type deregisterer interface {
+	Deregister(ctx context.Context, workerID string) error
 }
 
 // fetch leases up to limit jobs: expired leases from dead workers first, then

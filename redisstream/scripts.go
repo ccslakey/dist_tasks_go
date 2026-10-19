@@ -107,3 +107,30 @@ for _ = 1, 10 do
 end
 return {cursor, out}
 `)
+
+// Removes a consumer from the group if it holds no pending entries.
+// DELCONSUMER drops a consumer's pending entries along with it, so the check
+// and the delete have to be one step.
+// KEYS[1]=stream ARGV[1]=group ARGV[2]=consumer
+var deregisterScript = redis.NewScript(`
+if #redis.call('XPENDING', KEYS[1], ARGV[1], '-', '+', 1, ARGV[2]) > 0 then return 0 end
+redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], ARGV[2])
+return 1
+`)
+
+// Removes consumers that hold nothing and have been idle at least ARGV[2] ms:
+// workers that crashed or were replaced. A live worker that gets pruned is
+// re-created by its next XREADGROUP.
+// KEYS[1]=stream ARGV[1]=group ARGV[2]=min idle ms
+var pruneConsumersScript = redis.NewScript(`
+local removed = 0
+for _, c in ipairs(redis.call('XINFO', 'CONSUMERS', KEYS[1], ARGV[1])) do
+  local f = {}
+  for i = 1, #c, 2 do f[c[i]] = c[i + 1] end
+  if f['pending'] == 0 and f['idle'] >= tonumber(ARGV[2]) then
+    redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], f['name'])
+    removed = removed + 1
+  end
+end
+return removed
+`)

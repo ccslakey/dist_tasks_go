@@ -32,3 +32,18 @@ func TestShouldDeadLetter(t *testing.T) {
 		t.Fatal("expected exhausted job to dead-letter")
 	}
 }
+
+func TestRetryPolicyJitterStaysInRange(t *testing.T) {
+	policy := RetryPolicy{BaseDelay: time.Second, MaxDelay: 10 * time.Second, Jitter: 0.5}
+	seen := map[time.Duration]bool{}
+	for range 100 {
+		got := policy.NextDelay(3) // 4s before jitter
+		if got < 2*time.Second || got >= 4*time.Second {
+			t.Fatalf("jittered delay %s outside [2s, 4s)", got)
+		}
+		seen[got] = true
+	}
+	if len(seen) < 10 {
+		t.Errorf("only %d distinct delays in 100 draws; jitter isn't spreading retries", len(seen))
+	}
+}
