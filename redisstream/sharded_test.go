@@ -245,3 +245,55 @@ func TestShardedRejectsUnknownPartition(t *testing.T) {
 		t.Errorf("Ack with partition 5 of 2: got %v", err)
 	}
 }
+
+// Jobs a long poll buffered while the worker was busy must keep their leases
+// until a Claim hands them out, or another worker recovers them and they run
+// twice.
+func TestShardedRenewsBufferedLeasesWithTheHeartbeat(t *testing.T) {
+	s := newTestSharded(t, 2)
+	ctx := t.Context()
+
+	for range 2 {
+		if _, err := s.Enqueue(ctx, newJob(3)); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	// Stand in for a long poll that delivered while the worker was at full
+	// concurrency: two jobs leased to worker-1, sitting in the buffer.
+	for p, part := range s.parts {
+		got, err := part.claimReady(ctx, "worker-1", 10)
+		if err != nil {
+			t.Fatalf("claimReady: %v", err)
+		}
+		s.buffered = append(s.buffered, tag(got, p)...)
+	}
+	if len(s.buffered) != 2 {
+		t.Fatalf("buffered %d jobs, want 2", len(s.buffered))
+	}
+	s.buffered[1].Lease.Token = 99 // this one's lease is already gone
+
+	const visibility = 100 * time.Millisecond
+	for range 4 {
+		time.Sleep(visibility / 2)
+		if errs := s.ExtendBatch(ctx, nil); len(errs) != 0 {
+			t.Fatalf("ExtendBatch with no running jobs returned %v", errs)
+		}
+	}
+	if len(s.buffered) != 1 {
+		t.Fatalf("buffer has %d jobs, want the stale one dropped", len(s.buffered))
+	}
+
+	recovered, err := s.RecoverExpired(ctx, visibility, "worker-2", 10)
+	if err != nil {
+		t.Fatalf("RecoverExpired: %v", err)
+	}
+	for _, job := range recovered {
+		if job.ID == s.buffered[0].ID {
+			t.Fatal("a buffered job's lease expired and another worker recovered it")
+		}
+	}
+	held := s.takeBuffered(10)
+	if err := s.Ack(ctx, held[0]); err != nil {
+		t.Errorf("Ack of a renewed buffered job: %v", err)
+	}
+}

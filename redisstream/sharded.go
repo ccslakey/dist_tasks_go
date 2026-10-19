@@ -2,10 +2,12 @@ package redisstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -450,8 +452,33 @@ func (s *Sharded) AckBatch(ctx context.Context, jobs []queue.Job) []error {
 	return s.perPartition(jobs, func(part *Store, batch []queue.Job) []error { return part.AckBatch(ctx, batch) })
 }
 
+// ExtendBatch renews the given leases and also, riding on the worker's
+// heartbeat, those of jobs the long polls buffered that no Claim has handed
+// out yet. A worker at full concurrency stops calling Claim, so without this
+// those leases would expire, another worker would recover the jobs, and the
+// stale buffered copies would run a second time. (An idle worker has no
+// heartbeat to ride on, but it's calling Claim, which drains the buffer.)
+// Buffered jobs whose lease turns out to be lost are dropped.
 func (s *Sharded) ExtendBatch(ctx context.Context, jobs []queue.Job) []error {
-	return s.perPartition(jobs, func(part *Store, batch []queue.Job) []error { return part.ExtendBatch(ctx, batch) })
+	s.mu.Lock()
+	buffered := slices.Clone(s.buffered)
+	s.mu.Unlock()
+
+	all := append(slices.Clone(jobs), buffered...)
+	errs := s.perPartition(all, func(part *Store, batch []queue.Job) []error { return part.ExtendBatch(ctx, batch) })
+
+	lost := map[queue.Lease]bool{}
+	for i, job := range buffered {
+		if errors.Is(errs[len(jobs)+i], queue.ErrLeaseLost) {
+			lost[job.Lease] = true
+		}
+	}
+	if len(lost) > 0 {
+		s.mu.Lock()
+		s.buffered = slices.DeleteFunc(s.buffered, func(j queue.Job) bool { return lost[j.Lease] })
+		s.mu.Unlock()
+	}
+	return errs[:len(jobs)]
 }
 
 // perPartition splits jobs by partition, runs call on each group in
