@@ -467,3 +467,23 @@ func TestEnqueueBatch(t *testing.T) {
 		t.Errorf("stream=%d scheduled=%d, want 3 and 1", stats.StreamLength, stats.RetryScheduled)
 	}
 }
+
+// A batch with idempotency keys must not depend on the script cache: Redis
+// doesn't roll back an EXEC when one command fails, so a NOSCRIPT inside the
+// transaction would store part of the batch.
+func TestEnqueueBatchSurvivesAFlushedScriptCache(t *testing.T) {
+	store := newTestStore(t)
+	ctx := t.Context()
+
+	keyed := newJob(3)
+	keyed.IdempotencyKey = "order-9"
+	if err := store.rds.ScriptFlush(ctx).Err(); err != nil {
+		t.Fatalf("SCRIPT FLUSH: %v", err)
+	}
+	if _, err := store.EnqueueBatch(ctx, []queue.Job{newJob(3), keyed, newJob(3)}); err != nil {
+		t.Fatalf("EnqueueBatch after SCRIPT FLUSH: %v", err)
+	}
+	if st, _ := store.Stats(ctx); st.StreamLength != 3 {
+		t.Errorf("stream length = %d, want 3", st.StreamLength)
+	}
+}

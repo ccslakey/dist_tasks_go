@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -167,13 +166,6 @@ func (b *Store) Enqueue(ctx context.Context, job queue.Job) (queue.JobID, error)
 // so either all of them are stored or none are. Jobs with idempotency keys
 // go through the same dedupe script as Enqueue.
 func (b *Store) EnqueueBatch(ctx context.Context, jobs []queue.Job) ([]queue.JobID, error) {
-	// Scripts run inside MULTI by SHA, so make sure Redis has this one. Only
-	// if it's needed: it costs a round trip, and on a cluster a broadcast.
-	if slices.ContainsFunc(jobs, func(j queue.Job) bool { return j.IdempotencyKey != "" }) {
-		if err := enqueueOnceScript.Load(ctx, b.rds).Err(); err != nil {
-			return nil, err
-		}
-	}
 	now := time.Now()
 	results := make([]*redis.Cmd, len(jobs))
 	_, err := b.rds.TxPipelined(ctx, func(p redis.Pipeliner) error {
@@ -192,7 +184,11 @@ func (b *Store) EnqueueBatch(ctx context.Context, jobs []queue.Job) ([]queue.Job
 			}
 			switch {
 			case job.IdempotencyKey != "":
-				results[i] = enqueueOnceScript.EvalSha(ctx, p,
+				// EVAL, not EVALSHA: Redis doesn't roll back the rest of an
+				// EXEC when one command fails, so a NOSCRIPT here (script
+				// cache flushed by a restart or failover) would commit the
+				// other jobs and break all-or-nothing.
+				results[i] = enqueueOnceScript.Eval(ctx, p,
 					[]string{b.config.DedupePrefix + job.IdempotencyKey, b.config.Stream, b.config.RetryKey, b.retryData},
 					string(job.ID), b.config.DedupeWindow.Milliseconds(), runAt, data)
 			case runAt > 0:
