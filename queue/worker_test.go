@@ -401,6 +401,40 @@ func (f *fakeBackend) deadLettered() map[JobID]string {
 	return f.dead
 }
 
+// When part of a batch fails, the caller must learn which jobs were stored
+// so a retry doesn't duplicate them.
+func TestEnqueueBatchReportsWhichJobsWereStored(t *testing.T) {
+	backend := &failingEnqueuer{fakeBackend: &fakeBackend{}, failAt: 3}
+	reqs := make([]EnqueueRequest, 5)
+	for i := range reqs {
+		reqs[i] = EnqueueRequest{Task: "email", Payload: i}
+	}
+	ids, err := New(backend).EnqueueBatch(t.Context(), reqs)
+	if err == nil {
+		t.Fatal("EnqueueBatch succeeded; want the third enqueue's error")
+	}
+	if len(ids) != 5 || ids[0] == "" || ids[1] == "" || ids[2] != "" || ids[3] != "" || ids[4] != "" {
+		t.Fatalf("ids = %q, want the first two set and the rest empty", ids)
+	}
+	if len(backend.ready) != 2 {
+		t.Errorf("stored %d jobs, want 2", len(backend.ready))
+	}
+}
+
+// failingEnqueuer fails the failAt-th Enqueue (1-based).
+type failingEnqueuer struct {
+	*fakeBackend
+	failAt, calls int
+}
+
+func (f *failingEnqueuer) Enqueue(ctx context.Context, job Job) (JobID, error) {
+	f.calls++
+	if f.calls == f.failAt {
+		return "", errors.New("connection reset")
+	}
+	return f.fakeBackend.Enqueue(ctx, job)
+}
+
 func TestEnqueueBatchFallsBackToSingleEnqueues(t *testing.T) {
 	backend := &fakeBackend{}
 	ids, err := New(backend).EnqueueBatch(t.Context(), []EnqueueRequest{

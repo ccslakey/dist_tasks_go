@@ -72,9 +72,15 @@ type EnqueueRequest struct {
 }
 
 // EnqueueBatch enqueues several jobs in one round trip when the backend
-// supports it, all or nothing. It returns one ID per request; a request whose
-// idempotency key was already used gets the original job's ID. All jobs in
-// the batch share one trace span.
+// supports it. It returns one ID per request; a request whose idempotency key
+// was already used gets the original job's ID. All jobs in the batch share one
+// trace span.
+//
+// On error, the IDs still say which jobs were stored: an empty ID means that
+// request wasn't, so retry only those (or give every request an idempotency
+// key and retry them all). A single Redis stores the whole batch or none of
+// it, but a sharded backend commits each partition separately, and backends
+// without batching enqueue one job at a time, so part of a batch can land.
 func (q *Queue) EnqueueBatch(ctx context.Context, reqs []EnqueueRequest) ([]JobID, error) {
 	jobs := make([]Job, len(reqs))
 	for i, r := range reqs {
@@ -94,21 +100,17 @@ func (q *Queue) EnqueueBatch(ctx context.Context, reqs []EnqueueRequest) ([]JobI
 		jobs[i+1].TraceParent = jobs[0].TraceParent
 	}
 
-	var ids []JobID
+	ids := make([]JobID, len(jobs))
+	var err error
 	if b, ok := q.backend.(batchEnqueuer); ok {
-		var err error
-		if ids, err = b.EnqueueBatch(ctx, jobs); err != nil {
-			setOutcome(ctx, "failed", err)
-			return nil, err
-		}
+		var got []JobID
+		got, err = b.EnqueueBatch(ctx, jobs)
+		copy(ids, got) // nil when nothing was stored
 	} else {
-		for _, job := range jobs {
-			id, err := q.backend.Enqueue(ctx, job)
-			if err != nil {
-				setOutcome(ctx, "failed", err)
-				return ids, err
+		for i, job := range jobs {
+			if ids[i], err = q.backend.Enqueue(ctx, job); err != nil {
+				break
 			}
-			ids = append(ids, id)
 		}
 	}
 	for i, job := range jobs {
@@ -116,12 +118,17 @@ func (q *Queue) EnqueueBatch(ctx context.Context, reqs []EnqueueRequest) ([]JobI
 			q.metrics.JobEnqueued(ctx, job)
 		}
 	}
+	if err != nil {
+		setOutcome(ctx, "failed", err)
+		return ids, err
+	}
 	setOutcome(ctx, "enqueued", nil)
 	return ids, nil
 }
 
 // batchEnqueuer is implemented by backends that can enqueue many jobs in one
-// round trip, all or nothing.
+// round trip. On error it returns the IDs of the jobs it did store (empty for
+// the rest), or nil if it stored none.
 type batchEnqueuer interface {
 	EnqueueBatch(ctx context.Context, jobs []Job) ([]JobID, error)
 }

@@ -236,7 +236,8 @@ func (s *Sharded) Enqueue(ctx context.Context, job queue.Job) (queue.JobID, erro
 
 // EnqueueBatch groups jobs by partition and enqueues each group in one
 // transaction, in parallel. It's all or nothing per partition, not across
-// the whole batch: on error, some partitions' jobs may have been stored.
+// the whole batch: on error, the returned IDs are set for the jobs whose
+// partitions committed and empty for the rest.
 func (s *Sharded) EnqueueBatch(ctx context.Context, jobs []queue.Job) ([]queue.JobID, error) {
 	groups := map[int][]int{} // partition -> indexes into jobs
 	for i := range jobs {
