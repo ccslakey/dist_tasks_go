@@ -56,6 +56,9 @@ type Lease struct {
 	MessageID string // backend delivery handle (the Redis stream entry ID)
 	Owner     string // worker ID holding the lease
 	Token     int64  // fencing token; increases every time the job is redelivered
+	// Partition identifies which partition of a sharded backend holds the
+	// delivery, so Ack and friends can be routed back to it. 0 if unsharded.
+	Partition int
 }
 
 type EnqueueOptions struct {

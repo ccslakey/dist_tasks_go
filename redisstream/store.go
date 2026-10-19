@@ -30,8 +30,9 @@ type Config struct {
 }
 
 type Store struct {
-	config Config
-	rds    *redis.Client
+	config     Config
+	rds        redis.UniversalClient
+	ownsClient bool // Close closes rds only if New created it
 	// retryData holds the fields of each scheduled job, keyed by job ID.
 	retryData string
 
@@ -41,10 +42,31 @@ type Store struct {
 	lastPrune     time.Time
 }
 
+// New connects to the Redis at config.Addr and returns a store for one queue.
 func New(config Config) (*Store, error) {
 	if config.Addr == "" {
 		config.Addr = "localhost:6379"
 	}
+	client := redis.NewClient(&redis.Options{
+		Addr:     config.Addr,
+		Password: "", // no password
+		DB:       0,  // use default DB
+		Protocol: 2,
+	})
+	store, err := NewWithClient(client, config)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
+	store.ownsClient = true
+	return store, nil
+}
+
+// NewWithClient returns a store that uses an existing client, which may be a
+// Redis Cluster client. config.Addr is ignored. Every key the store uses for
+// one queue must hash to the same cluster slot, since its Lua scripts touch
+// several at once; Sharded arranges that with hash tags.
+func NewWithClient(client redis.UniversalClient, config Config) (*Store, error) {
 	if config.Stream == "" {
 		config.Stream = "dtq:jobs"
 	}
@@ -66,28 +88,24 @@ func New(config Config) (*Store, error) {
 	if config.ConsumerIdleTimeout <= 0 {
 		config.ConsumerIdleTimeout = time.Hour
 	}
-	rdsCli := redis.NewClient(&redis.Options{
-		Addr:     config.Addr,
-		Password: "", // no password
-		DB:       0,  // use default DB
-		Protocol: 2,
-	})
-
 	// "0" rather than "$" so entries added before the group existed still get processed.
-	_, err := rdsCli.XGroupCreateMkStream(context.Background(), config.Stream, config.Group, "0").Result()
+	_, err := client.XGroupCreateMkStream(context.Background(), config.Stream, config.Group, "0").Result()
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
 		return nil, err
 	}
 
 	return &Store{
 		config:        config,
-		rds:           rdsCli,
+		rds:           client,
 		retryData:     config.RetryKey + ":jobs",
 		recoverCursor: "0-0",
 	}, nil
 }
 
 func (b *Store) Close() error {
+	if !b.ownsClient {
+		return nil
+	}
 	return b.rds.Close()
 }
 
@@ -215,7 +233,15 @@ func (b *Store) schedule(ctx context.Context, job queue.Job, runAt time.Time) er
 }
 
 func (b *Store) Claim(ctx context.Context, workerID string, limit int, wait time.Duration) ([]queue.Job, error) {
-	// Promote due retries and claim what's ready in one round trip.
+	jobs, err := b.claimReady(ctx, workerID, limit)
+	if err != nil || len(jobs) > 0 || wait <= 0 {
+		return jobs, err
+	}
+	return b.claimBlocking(ctx, workerID, limit, wait)
+}
+
+// claimReady promotes due retries and claims what's ready, in one round trip.
+func (b *Store) claimReady(ctx context.Context, workerID string, limit int) ([]queue.Job, error) {
 	res, err := claimScript.Run(ctx, b.rds,
 		[]string{b.config.Stream, b.config.RetryKey, b.retryData},
 		b.config.Group, workerID, limit, time.Now().UnixMilli()).Slice()
@@ -234,11 +260,12 @@ func (b *Store) Claim(ctx context.Context, workerID string, limit int, wait time
 			jobs = append(jobs, job)
 		}
 	}
-	if len(res) > 0 || wait <= 0 {
-		return jobs, nil
-	}
+	return jobs, nil
+}
 
-	// Nothing was ready: block until a new entry arrives or wait elapses.
+// claimBlocking waits up to wait for new entries and claims them. It doesn't
+// promote retries: XREADGROUP can't block inside a script.
+func (b *Store) claimBlocking(ctx context.Context, workerID string, limit int, wait time.Duration) ([]queue.Job, error) {
 	streams, err := b.rds.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    b.config.Group,
 		Consumer: workerID,
@@ -253,6 +280,7 @@ func (b *Store) Claim(ctx context.Context, workerID string, limit int, wait time
 		return nil, fmt.Errorf("xreadgroup for %s: %w", workerID, err)
 	}
 
+	var jobs []queue.Job
 	for _, s := range streams {
 		for _, msg := range s.Messages {
 			// A fresh delivery always has delivery count 1.
