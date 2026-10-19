@@ -2,6 +2,7 @@ package prommetrics
 
 import (
 	"testing"
+	"time"
 
 	"dist_tasks_go/queue"
 
@@ -78,20 +79,26 @@ func TestStartTimesCleanedUpOnDeadLettered(t *testing.T) {
 	}
 }
 
-// Worst case: a worker that crashes (or a buggy handler path) calls JobStarted
-// many times without ever reaching a terminal callback. The map will grow
-// unboundedly. This test documents the failure mode — there is no automatic
-// cleanup. A future fix could add a TTL sweep or expose a max-age cap.
-func TestStartTimesGrowWithoutTerminalCallback(t *testing.T) {
+// Runs that never reach a terminal callback (an ack that failed on a network
+// error, a run abandoned at shutdown) must not leave their start time in the
+// map forever.
+func TestStaleStartTimesAreSwept(t *testing.T) {
 	m := newMetrics()
+	m.sweepEvery = 0 // sweep on every JobStarted; nothing is stale yet (1h)
 
 	const n = 1000
 	for i := 0; i < n; i++ {
 		m.JobStarted(t.Context(), queue.Job{ID: queue.JobID(string(rune(i))), Task: "email"})
 	}
-
 	if got := pendingStarts(m); got != n {
-		t.Errorf("after %d JobStarted with no terminal callback: %d entries, want %d (this test exists to make the leak visible)", n, got, n)
+		t.Fatalf("after %d JobStarted: %d entries, want %d", n, got, n)
+	}
+
+	m.staleAfter = 0 // now everything older than the next start is stale
+	time.Sleep(time.Millisecond)
+	m.JobStarted(t.Context(), queue.Job{ID: "fresh", Task: "email"})
+	if got := pendingStarts(m); got != 1 {
+		t.Errorf("after the stale entries aged out: %d entries, want only the fresh one", got)
 	}
 }
 

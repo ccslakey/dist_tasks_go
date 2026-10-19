@@ -12,6 +12,7 @@ import (
 	"context"
 	"dist_tasks_go/queue"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -41,6 +42,13 @@ type Metrics struct {
 	// startTimes tracks per-delivery start timestamps so the terminal
 	// callbacks can observe duration. Keyed by startKey.
 	startTimes sync.Map
+	// Runs that never reach a terminal callback (an ack that failed on a
+	// network error, a run abandoned at shutdown) would leave their entry
+	// forever, so entries older than staleAfter are swept, at most once per
+	// sweepEvery.
+	staleAfter time.Duration
+	sweepEvery time.Duration
+	lastSweep  atomic.Int64 // unix nanos
 
 	initialized sync.Map // tasks whose outcome series have been created
 }
@@ -125,6 +133,9 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help: "Current number of jobs waiting in the retry sorted set.",
 		}),
 	}
+	m.staleAfter = time.Hour
+	m.sweepEvery = time.Minute
+	m.lastSweep.Store(time.Now().UnixNano())
 	return m
 }
 
@@ -147,10 +158,27 @@ func (m *Metrics) initTask(task string) {
 	m.leaseLost.WithLabelValues(task)
 }
 
+// sweepStale drops start times older than staleAfter. Their runs ended
+// without a terminal callback, so they'd otherwise never be removed.
+func (m *Metrics) sweepStale(now time.Time) {
+	last := m.lastSweep.Load()
+	if now.UnixNano()-last < int64(m.sweepEvery) || !m.lastSweep.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	m.startTimes.Range(func(k, v any) bool {
+		if now.Sub(v.(time.Time)) > m.staleAfter {
+			m.startTimes.Delete(k)
+		}
+		return true
+	})
+}
+
 func (m *Metrics) JobStarted(_ context.Context, job queue.Job) {
 	m.initTask(job.Task)
 	// stash time.Now() so JobCompleted/JobFailed can call duration.Observe.
-	m.startTimes.Store(keyOf(job), time.Now())
+	now := time.Now()
+	m.startTimes.Store(keyOf(job), now)
+	m.sweepStale(now)
 	if job.Attempt == 0 && job.Lease.Token == 1 { // first run only; later runs include backoff or recovery time
 		m.pickup.WithLabelValues(job.Task).Observe(time.Since(job.AvailableAt).Seconds())
 	}
