@@ -20,6 +20,9 @@ go run ./cmd/worker-demo
 
 # Fault-injection test: worker processes are SIGKILLed/SIGSTOPped while they run
 go run ./cmd/chaos
+
+# Throughput and pickup-latency benchmark
+go run ./cmd/bench
 ```
 
 ## Architecture
@@ -42,15 +45,16 @@ application code (cmd/enqueue-demo)
  Redis Streams (main stream) + sorted set & hash (retry/delay schedule) + DLQ stream
         ^
         |
- queue.Worker           — slot-bounded claim loop, lease heartbeats, graceful drain
+ queue.Worker           — slot-bounded blocking claim loop, lease heartbeats,
+                          group-committed acks (AckBatch), graceful drain
 ```
 
 **Key types:**
 
-- `queue.Job` — task name, JSON payload, `Attempt` (previous failed runs), `MaxAttempts` (total runs allowed), timestamps. `ID` is a stable UUID that survives retries and redeliveries.
+- `queue.Job` — task name, JSON payload, `Attempt` (previous failed runs), `MaxAttempts` (total runs allowed), timestamps. `ID` is a stable UUID that survives retries and redeliveries; `FencingToken()` increases with every retry and redelivery, for downstream systems to reject stale runs.
 - `queue.Lease` — one delivery of a job to a worker: stream message ID, owner, and fencing token (the Redis delivery count). Ack/Retry/DeadLetter/Extend are fenced by it and return `queue.ErrLeaseLost` when another worker has taken over.
 - `queue.JobResult` — handler return value; use `NewRetryableError` / `NewPermanentError` to signal failure semantics
-- `queue.WorkerConfig` — Concurrency, PollInterval, VisibilityTimeout, HeartbeatInterval, ShutdownTimeout, MaxDeliveries, StatsInterval, RetryPolicy
+- `queue.WorkerConfig` — Concurrency, PollInterval (claim block time), PollOnly, VisibilityTimeout, HeartbeatInterval, ShutdownTimeout, MaxDeliveries, StatsInterval, RetryPolicy (with Jitter)
 - `queue.Metrics` — interface with a `NoopMetrics` default; `prommetrics.Metrics` is the Prometheus adapter
 - `redisstream.Config` — Redis address, stream name, consumer group name, retry sorted-set key, DLQ stream name
 
@@ -59,6 +63,7 @@ application code (cmd/enqueue-demo)
 - Consumer group: `dtq:workers`
 - Retry/delay schedule: `dtq:retry` (sorted set of job IDs by run-at ms) + `dtq:retry:jobs` (hash of job fields)
 - Dead-letter stream: `dtq:dead`
+- Enqueue idempotency keys: `dtq:dedupe:<key>` (expire after `DedupeWindow`, 24h)
 
 ## Testing
 
