@@ -579,29 +579,27 @@ func (b *Store) promoteRetries(ctx context.Context, limit int) (int, error) {
 		time.Now().UnixMilli(), limit).Int()
 }
 
+// Stats reads the queue's gauges in one pipelined round trip.
 func (b *Store) Stats(ctx context.Context) (queue.Stats, error) {
-
-	streamLen, err := b.rds.XLen(ctx, b.config.Stream).Result()
+	var (
+		streamLen, deadLen *redis.IntCmd
+		pend               *redis.XPendingCmd
+		retries            *redis.IntCmd
+	)
+	_, err := b.rds.Pipelined(ctx, func(p redis.Pipeliner) error {
+		streamLen = p.XLen(ctx, b.config.Stream)
+		pend = p.XPending(ctx, b.config.Stream, b.config.Group)
+		deadLen = p.XLen(ctx, b.config.DeadLetter)
+		retries = p.ZCard(ctx, b.config.RetryKey)
+		return nil
+	})
 	if err != nil {
 		return queue.Stats{}, err
 	}
-	pend, err := b.rds.XPending(ctx, b.config.Stream, b.config.Group).Result()
-	if err != nil {
-		return queue.Stats{}, err
-	}
-	deadLen, err := b.rds.XLen(ctx, b.config.DeadLetter).Result()
-	if err != nil {
-		return queue.Stats{}, err
-	}
-	retries, err := b.rds.ZCard(ctx, b.config.RetryKey).Result()
-	if err != nil {
-		return queue.Stats{}, err
-	}
-
 	return queue.Stats{
-		StreamLength:    streamLen,
-		InFlight:        pend.Count,
-		DeadLetterDepth: deadLen,
-		RetryScheduled:  retries,
+		StreamLength:    streamLen.Val(),
+		InFlight:        pend.Val().Count,
+		DeadLetterDepth: deadLen.Val(),
+		RetryScheduled:  retries.Val(),
 	}, nil
 }

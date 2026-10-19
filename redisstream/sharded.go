@@ -519,12 +519,20 @@ func (s *Sharded) Deregister(ctx context.Context, workerID string) error {
 	return nil
 }
 
+// Stats sums every partition's gauges, querying the partitions in parallel.
 func (s *Sharded) Stats(ctx context.Context) (queue.Stats, error) {
-	var total queue.Stats
+	stats := make([]queue.Stats, len(s.parts))
+	errs := make([]error, len(s.parts))
+	var wg sync.WaitGroup
 	for p, part := range s.parts {
-		st, err := part.Stats(ctx)
-		if err != nil {
-			return queue.Stats{}, fmt.Errorf("partition %d: %w", p, err)
+		wg.Go(func() { stats[p], errs[p] = part.Stats(ctx) })
+	}
+	wg.Wait()
+
+	var total queue.Stats
+	for p, st := range stats {
+		if errs[p] != nil {
+			return queue.Stats{}, fmt.Errorf("partition %d: %w", p, errs[p])
 		}
 		total.StreamLength += st.StreamLength
 		total.InFlight += st.InFlight
