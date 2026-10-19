@@ -273,6 +273,9 @@ func (w *Worker) process(ctx context.Context, job Job) {
 // exhausted. A job is complete only once the handler succeeds and the ack
 // lands, so a crash anywhere before that means it will run again.
 func (w *Worker) handleOne(ctx context.Context, job Job) error {
+	ctx, span := startProcessSpan(ctx, job, w.config.ID)
+	defer span.End()
+
 	if job.Lease.Token > int64(w.config.MaxDeliveries) {
 		return w.deadLetter(ctx, job, fmt.Sprintf("delivered %d times without being settled", job.Lease.Token))
 	}
@@ -286,14 +289,17 @@ func (w *Worker) handleOne(ctx context.Context, job Job) error {
 	if ctx.Err() != nil {
 		// The lease was lost or shutdown timed out mid-run. Whoever owns the
 		// job now (or recovery) decides its fate.
+		setOutcome(ctx, "abandoned", context.Cause(ctx))
 		return context.Cause(ctx)
 	}
 
 	if jobRes.Err == nil {
 		if err := w.ack(ctx, job); err != nil {
+			setOutcome(ctx, "settle_failed", err)
 			return err
 		}
 		w.metrics.JobCompleted(ctx, job)
+		setOutcome(ctx, "completed", nil)
 		return nil
 	}
 
@@ -303,17 +309,21 @@ func (w *Worker) handleOne(ctx context.Context, job Job) error {
 	}
 	nextRunAt := time.Now().UTC().Add(w.config.RetryPolicy.NextDelay(job.Attempt + 1))
 	if err := w.backend.Retry(ctx, job, nextRunAt); err != nil {
+		setOutcome(ctx, "settle_failed", err)
 		return err
 	}
 	w.metrics.JobRetried(ctx, job)
+	setOutcome(ctx, "retried", jobRes.Err)
 	return nil
 }
 
 func (w *Worker) deadLetter(ctx context.Context, job Job, reason string) error {
 	if err := w.backend.DeadLetter(ctx, job, reason); err != nil {
+		setOutcome(ctx, "settle_failed", err)
 		return err
 	}
 	w.metrics.JobDeadLettered(ctx, job)
+	setOutcome(ctx, "dead_lettered", errors.New(reason))
 	slog.Warn("job dead-lettered", "worker", w.config.ID, "job_id", job.ID, "task", job.Task, "reason", reason)
 	return nil
 }

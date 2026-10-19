@@ -4,6 +4,7 @@ import (
 	"context"
 	"dist_tasks_go/examples/tasks"
 	"dist_tasks_go/internal/prettylog"
+	"dist_tasks_go/internal/telemetry"
 	"dist_tasks_go/prommetrics"
 	"dist_tasks_go/queue"
 	"dist_tasks_go/redisstream"
@@ -24,6 +25,7 @@ func main() {
 	id := flag.String("id", fmt.Sprintf("%s-%d", host, os.Getpid()), "worker ID; must be unique per running worker")
 	metricsAddr := flag.String("metrics-addr", ":9090", "address for the /metrics endpoint (empty disables it)")
 	concurrency := flag.Int("concurrency", 4, "max jobs this worker runs at once")
+	redisAddr := flag.String("redis", envOr("DTQ_REDIS_ADDR", "localhost:6379"), "Redis address")
 	flag.Parse()
 
 	slog.SetDefault(slog.New(prettylog.NewHandler(os.Stdout)))
@@ -31,7 +33,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	backend, err := redisstream.New(redisstream.Config{})
+	shutdownTracing, err := telemetry.Setup(ctx, "dtq-worker")
+	if err != nil {
+		slog.Error("tracing setup failed", "err", err)
+		os.Exit(1)
+	}
+	defer shutdownTracing(context.Background())
+
+	backend, err := redisstream.New(redisstream.Config{Addr: *redisAddr})
 	if err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
@@ -74,4 +83,11 @@ func main() {
 	if err := worker.Run(ctx); err != nil && err != context.Canceled {
 		slog.Error(err.Error())
 	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

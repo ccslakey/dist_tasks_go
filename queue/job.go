@@ -24,7 +24,7 @@ type Job struct {
 	Payload     json.RawMessage `json:"payload"`      // stored as string(payload); cast back with json.RawMessage(s)
 	Attempt     int             `json:"attempt"`      // number of previous failed attempts (0 on the first run)
 	MaxAttempts int             `json:"max_attempts"` // total runs allowed before the job is dead-lettered
-	TraceID     string          `json:"trace_id,omitempty"`
+	TraceParent string          `json:"trace_parent,omitempty"` // W3C traceparent of the enqueue span
 	CreatedAt   time.Time       `json:"created_at"`   // store/parse as time.RFC3339Nano
 	AvailableAt time.Time       `json:"available_at"` // store/parse as time.RFC3339Nano
 
@@ -61,7 +61,6 @@ type Lease struct {
 type EnqueueOptions struct {
 	MaxAttempts int
 	Delay       time.Duration
-	TraceID     string
 	// IdempotencyKey dedupes retried enqueues; see Job.IdempotencyKey.
 	IdempotencyKey string
 }

@@ -99,7 +99,7 @@ func jobFields(job queue.Job) map[string]string {
 		"payload":     string(job.Payload),
 		"attempt":     strconv.Itoa(job.Attempt),
 		"maxAttempts": strconv.Itoa(job.MaxAttempts),
-		"traceID":     job.TraceID,
+		"traceparent": job.TraceParent,
 		"createdAt":   job.CreatedAt.Format(time.RFC3339Nano),
 		"availableAt": job.AvailableAt.Format(time.RFC3339Nano),
 	}
@@ -255,9 +255,7 @@ func parseJob(msgID string, vals map[string]any, lease queue.Lease) (queue.Job, 
 	if job.MaxAttempts, err = num("maxAttempts"); err != nil {
 		return job, err
 	}
-	if job.TraceID, err = str("traceID"); err != nil {
-		return job, err
-	}
+	job.TraceParent, _ = vals["traceparent"].(string) // optional
 	if job.CreatedAt, err = ts("createdAt"); err != nil {
 		return job, err
 	}

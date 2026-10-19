@@ -60,7 +60,6 @@ func (q *Queue) Enqueue(ctx context.Context, task string, payload any, opts Enqu
 		Payload:        raw,
 		Attempt:        0,
 		MaxAttempts:    maxAttempts,
-		TraceID:        opts.TraceID,
 		CreatedAt:      now,
 		AvailableAt:    now.Add(opts.Delay),
 		IdempotencyKey: opts.IdempotencyKey,
@@ -69,12 +68,18 @@ func (q *Queue) Enqueue(ctx context.Context, task string, payload any, opts Enqu
 		return "", err
 	}
 
+	ctx, span := startEnqueueSpan(ctx, &job)
+	defer span.End()
 	id, err := q.backend.Enqueue(ctx, job)
 	if err != nil {
+		setOutcome(ctx, "failed", err)
 		return "", err
 	}
-	if id == job.ID { // otherwise it was a duplicate of an earlier enqueue
+	if id == job.ID {
 		q.metrics.JobEnqueued(ctx, job)
+		setOutcome(ctx, "enqueued", nil)
+	} else {
+		setOutcome(ctx, "duplicate", nil) // an earlier enqueue used the same idempotency key
 	}
 	return id, nil
 }

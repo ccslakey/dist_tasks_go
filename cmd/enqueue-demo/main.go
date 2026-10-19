@@ -10,6 +10,7 @@ import (
 
 	"dist_tasks_go/examples/tasks"
 	"dist_tasks_go/internal/prettylog"
+	"dist_tasks_go/internal/telemetry"
 	"dist_tasks_go/prommetrics"
 	"dist_tasks_go/queue"
 	"dist_tasks_go/redisstream"
@@ -20,13 +21,20 @@ func main() {
 	delay := flag.Duration("delay", 50*time.Millisecond, "delay between enqueues")
 	task := flag.String("task", "send_email", "task name: send_email | process_image | permanent_fail | flaky_email")
 	latency := flag.Duration("latency", 0, "artificial latency injected into each job handler (e.g. 500ms)")
+	redisAddr := flag.String("redis", envOr("DTQ_REDIS_ADDR", "localhost:6379"), "Redis address")
 	flag.Parse()
 
 	slog.SetDefault(slog.New(prettylog.NewHandler(os.Stdout)))
 
 	ctx := context.Background()
 
-	backend, err := redisstream.New(redisstream.Config{})
+	shutdownTracing, err := telemetry.Setup(ctx, "dtq-producer")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer shutdownTracing(context.Background())
+
+	backend, err := redisstream.New(redisstream.Config{Addr: *redisAddr})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -71,4 +79,11 @@ func payloadFor(task string, latencyMs int) (any, int) {
 			LatencyMs: latencyMs,
 		}, 3
 	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
