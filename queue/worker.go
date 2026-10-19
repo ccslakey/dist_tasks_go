@@ -231,7 +231,9 @@ func (w *Worker) fetch(ctx context.Context, limit int, lastRecover *time.Time) (
 	if time.Since(*lastRecover) >= w.config.PollInterval {
 		recovered, err := w.backend.RecoverExpired(ctx, w.config.VisibilityTimeout, w.config.ID, limit)
 		if err != nil {
-			return nil, fmt.Errorf("recover expired: %w", err)
+			// A sharded backend can fail on one partition after leasing jobs
+			// from others. Those are ours now and must still run.
+			return recovered, fmt.Errorf("recover expired: %w", err)
 		}
 		if len(recovered) < limit {
 			*lastRecover = time.Now()

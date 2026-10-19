@@ -201,6 +201,24 @@ func TestWorkerShutdownDrainsAndAcksInFlightJobs(t *testing.T) {
 	}
 }
 
+// A sharded backend can lease jobs from some partitions and then fail on
+// another. The leased jobs must still run instead of waiting out another
+// visibility timeout.
+func TestWorkerRunsJobsRecoveredAlongsideAnError(t *testing.T) {
+	backend := &fakeBackend{
+		recoverable: []Job{testJob("job-1", "email"), testJob("job-2", "email")},
+		recoverErr:  errors.New("partition 3: connection refused"),
+	}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", Concurrency: 4, PollInterval: time.Millisecond}, nil)
+	worker.Register("email", func(context.Context, Job) JobResult { return JobResult{} })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	waitFor(t, func() bool { return backend.ackedCount() == 2 })
+	cancel()
+	<-done
+}
+
 func TestWorkerSurvivesTransientClaimErrors(t *testing.T) {
 	backend := &fakeBackend{ready: []Job{testJob("job-1", "email")}, claimErrs: 2}
 	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", PollInterval: time.Millisecond}, nil)
@@ -283,6 +301,9 @@ type fakeBackend struct {
 	claimErrs int   // fail this many Claim calls before succeeding
 	extendErr error // returned by every Extend
 
+	recoverable []Job // returned once by RecoverExpired, along with recoverErr
+	recoverErr  error
+
 	acked   []Job
 	retried []Job
 	dead    map[JobID]string
@@ -316,7 +337,14 @@ func (f *fakeBackend) Claim(ctx context.Context, _ string, limit int, wait time.
 }
 
 func (f *fakeBackend) RecoverExpired(ctx context.Context, _ time.Duration, _ string, _ int) ([]Job, error) {
-	return nil, ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	jobs := f.recoverable
+	f.recoverable = nil
+	return jobs, f.recoverErr
 }
 
 func (f *fakeBackend) Extend(ctx context.Context, _ Job) error {
