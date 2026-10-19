@@ -174,13 +174,19 @@ func (b *Store) EnqueueBatch(ctx context.Context, jobs []queue.Job) ([]queue.Job
 			if job.ID == "" {
 				job.ID = queue.NewJobID()
 			}
-			data, err := json.Marshal(jobFields(*job))
-			if err != nil {
-				return err
-			}
+			fields := jobFields(*job)
 			var runAt int64
 			if job.AvailableAt.After(now) {
 				runAt = job.AvailableAt.UnixMilli()
+			}
+			if job.IdempotencyKey == "" && runAt == 0 {
+				p.XAdd(ctx, &redis.XAddArgs{Stream: b.config.Stream, Values: fields})
+				continue
+			}
+			// Keyed and delayed jobs store their fields as JSON.
+			data, err := json.Marshal(fields)
+			if err != nil {
+				return err
 			}
 			switch {
 			case job.IdempotencyKey != "":
@@ -191,11 +197,9 @@ func (b *Store) EnqueueBatch(ctx context.Context, jobs []queue.Job) ([]queue.Job
 				results[i] = enqueueOnceScript.Eval(ctx, p,
 					[]string{b.config.DedupePrefix + job.IdempotencyKey, b.config.Stream, b.config.RetryKey, b.retryData},
 					string(job.ID), b.config.DedupeWindow.Milliseconds(), runAt, data)
-			case runAt > 0:
+			default:
 				p.HSet(ctx, b.retryData, string(job.ID), data)
 				p.ZAdd(ctx, b.config.RetryKey, redis.Z{Score: float64(runAt), Member: string(job.ID)})
-			default:
-				p.XAdd(ctx, &redis.XAddArgs{Stream: b.config.Stream, Values: jobFields(*job)})
 			}
 		}
 		return nil
