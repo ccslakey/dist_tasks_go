@@ -28,9 +28,24 @@ type Job struct {
 	CreatedAt   time.Time       `json:"created_at"`   // store/parse as time.RFC3339Nano
 	AvailableAt time.Time       `json:"available_at"` // store/parse as time.RFC3339Nano
 
+	// IdempotencyKey, if set at enqueue, makes the enqueue idempotent: another
+	// enqueue with the same key inside the backend's dedupe window returns the
+	// original job's ID instead of creating a second job.
+	IdempotencyKey string `json:"-"`
+
 	// Lease is set by the backend when the job is claimed or recovered. It is
 	// not part of the job's stored state.
 	Lease Lease `json:"-"`
+}
+
+// FencingToken orders every run of a job: it increases with each retry and
+// each redelivery, so a run that holds an older token has been superseded.
+// Pass it to downstream systems along with job.ID, and have them reject
+// writes carrying a lower token than the highest they've seen for that job.
+// That stops a paused "zombie" worker from applying a stale side effect
+// after its lease was taken over, which the queue alone can't prevent.
+func (j Job) FencingToken() int64 {
+	return int64(j.Attempt)<<32 | j.Lease.Token
 }
 
 // Lease identifies one delivery of a job to one worker. Backends use it to
@@ -47,6 +62,8 @@ type EnqueueOptions struct {
 	MaxAttempts int
 	Delay       time.Duration
 	TraceID     string
+	// IdempotencyKey dedupes retried enqueues; see Job.IdempotencyKey.
+	IdempotencyKey string
 }
 
 type JobResult struct {

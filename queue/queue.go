@@ -55,13 +55,15 @@ func (q *Queue) Enqueue(ctx context.Context, task string, payload any, opts Enqu
 
 	now := q.now().UTC()
 	job := Job{
-		Task:        task,
-		Payload:     raw,
-		Attempt:     0,
-		MaxAttempts: maxAttempts,
-		TraceID:     opts.TraceID,
-		CreatedAt:   now,
-		AvailableAt: now.Add(opts.Delay),
+		ID:             NewJobID(),
+		Task:           task,
+		Payload:        raw,
+		Attempt:        0,
+		MaxAttempts:    maxAttempts,
+		TraceID:        opts.TraceID,
+		CreatedAt:      now,
+		AvailableAt:    now.Add(opts.Delay),
+		IdempotencyKey: opts.IdempotencyKey,
 	}
 	if err := job.Validate(); err != nil {
 		return "", err
@@ -71,7 +73,8 @@ func (q *Queue) Enqueue(ctx context.Context, task string, payload any, opts Enqu
 	if err != nil {
 		return "", err
 	}
-	job.ID = id
-	q.metrics.JobEnqueued(ctx, job)
+	if id == job.ID { // otherwise it was a duplicate of an earlier enqueue
+		q.metrics.JobEnqueued(ctx, job)
+	}
 	return id, nil
 }

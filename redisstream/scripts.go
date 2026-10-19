@@ -134,3 +134,27 @@ for _, c in ipairs(redis.call('XINFO', 'CONSUMERS', KEYS[1], ARGV[1])) do
 end
 return removed
 `)
+
+// Enqueues a job unless its idempotency key was used within the dedupe
+// window, in which case it returns the original job's ID. The check and the
+// write are one step, so concurrent retries of the same enqueue can't both win.
+// KEYS[1]=dedupe key KEYS[2]=stream KEYS[3]=schedule zset KEYS[4]=schedule data hash
+// ARGV[1]=job ID ARGV[2]=dedupe window ms ARGV[3]=run-at unix ms (0 = now)
+// ARGV[4]=job fields as JSON
+var enqueueOnceScript = redis.NewScript(`
+local existing = redis.call('GET', KEYS[1])
+if existing then return existing end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+if tonumber(ARGV[3]) > 0 then
+  redis.call('HSET', KEYS[4], ARGV[1], ARGV[4])
+  redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1])
+else
+  local fields = {}
+  for k, v in pairs(cjson.decode(ARGV[4])) do
+    fields[#fields + 1] = k
+    fields[#fields + 1] = v
+  end
+  redis.call('XADD', KEYS[2], '*', unpack(fields))
+end
+return ARGV[1]
+`)

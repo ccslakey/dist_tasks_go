@@ -47,3 +47,18 @@ func TestRetryPolicyJitterStaysInRange(t *testing.T) {
 		t.Errorf("only %d distinct delays in 100 draws; jitter isn't spreading retries", len(seen))
 	}
 }
+
+func TestFencingTokenIncreasesAcrossRetriesAndRedeliveries(t *testing.T) {
+	runs := []Job{
+		{Attempt: 0, Lease: Lease{Token: 1}},
+		{Attempt: 0, Lease: Lease{Token: 2}}, // redelivered after a crash
+		{Attempt: 1, Lease: Lease{Token: 1}}, // retried: new stream entry, delivery count restarts
+		{Attempt: 1, Lease: Lease{Token: 7}},
+		{Attempt: 2, Lease: Lease{Token: 1}},
+	}
+	for i := 1; i < len(runs); i++ {
+		if runs[i].FencingToken() <= runs[i-1].FencingToken() {
+			t.Errorf("run %d token %d not greater than run %d token %d", i, runs[i].FencingToken(), i-1, runs[i-1].FencingToken())
+		}
+	}
+}

@@ -1,14 +1,17 @@
 // Command chaos is a fault-injection test for the queue. It enqueues a batch
 // of jobs, runs several worker processes against them, and SIGKILLs and
-// SIGSTOPs workers at random while they work. Then it checks the delivery
-// guarantees against a ledger the handlers write to:
+// SIGSTOPs workers at random while they work. Some enqueues are sent twice,
+// as a producer would after a lost response. Then it checks the guarantees
+// against a ledger the handlers write to:
 //
 //   - no job is lost: each one either completed or was dead-lettered
 //   - jobs that fail permanently are dead-lettered and never complete
 //   - the queue drains completely (nothing stuck pending or scheduled)
+//   - every completed job's side effect landed exactly once downstream
 //
-// Duplicate executions are expected (delivery is at-least-once) and are
-// counted, not treated as failures.
+// Duplicate runs are expected (delivery is at-least-once) and are counted,
+// not treated as failures; the downstream's fencing and idempotency checks
+// are what keep them from becoming duplicate effects.
 //
 //	go run ./cmd/chaos
 //	go run ./cmd/chaos -jobs 20000 -workers 6 -kill-every 500ms
@@ -103,15 +106,17 @@ func main() {
 
 func storeConfig(o options) redisstream.Config {
 	return redisstream.Config{
-		Addr:       o.redisAddr,
-		Stream:     o.prefix + "jobs",
-		Group:      o.prefix + "workers",
-		RetryKey:   o.prefix + "retry",
-		DeadLetter: o.prefix + "dead",
+		Addr:                o.redisAddr,
+		Stream:              o.prefix + "jobs",
+		Group:               o.prefix + "workers",
+		RetryKey:            o.prefix + "retry",
+		DeadLetter:          o.prefix + "dead",
+		DedupePrefix:        o.prefix + "dedupe:",
+		ConsumerIdleTimeout: 10 * time.Second,
 	}
 }
 
-// Ledger keys. Handlers append one entry per completed execution:
+// Ledger keys. Handlers append one entry per run that reaches its side effect:
 // "<payload n> <start unix µs> <end unix µs> <worker id>". Jobs are identified
 // by payload number rather than job ID so the check doesn't depend on the
 // backend keeping IDs stable.
@@ -140,6 +145,7 @@ func runWorker(o options) error {
 		VisibilityTimeout: o.visibility,
 		RetryPolicy:       queue.RetryPolicy{BaseDelay: 50 * time.Millisecond, MaxDelay: time.Second},
 	}, leaseLostCounter{rdb: rdb, key: leaseLostKey(o.prefix)})
+	ds := downstream{rdb: rdb, prefix: o.prefix}
 
 	w.Register(task, func(ctx context.Context, job queue.Job) queue.JobResult {
 		var p payload
@@ -147,6 +153,9 @@ func runWorker(o options) error {
 			return queue.NewPermanentError(err)
 		}
 		start := time.Now()
+		if ok, err := ds.begin(ctx, job); err != nil || !ok {
+			return queue.NewRetryableError(fmt.Errorf("superseded run (ok=%t): %v", ok, err))
+		}
 		select {
 		case <-time.After(time.Duration(p.LatencyMs) * time.Millisecond):
 		case <-ctx.Done(): // lease lost: stop before producing a side effect
@@ -158,11 +167,18 @@ func runWorker(o options) error {
 		if rand.Float64() < o.failRate {
 			return queue.NewRetryableError(errors.New("transient failure (chaos)"))
 		}
-		// The job's side effect. A crash between here and the ack is what
-		// makes delivery at-least-once.
+		// Record the run, then apply the side effect. A crash between here and
+		// the ack is what makes delivery at-least-once.
 		entry := fmt.Sprintf("%d %d %d %s", p.N, start.UnixMicro(), time.Now().UnixMicro(), o.workerID)
 		if err := rdb.RPush(ctx, ledgerKey(o.prefix), entry).Err(); err != nil {
 			return queue.NewRetryableError(err)
+		}
+		outcome, err := ds.apply(ctx, job, p.N)
+		if err != nil {
+			return queue.NewRetryableError(err)
+		}
+		if outcome == "fenced" {
+			return queue.NewRetryableError(errors.New("side effect rejected: superseded run"))
 		}
 		return queue.JobResult{}
 	})
@@ -241,8 +257,20 @@ func runController(o options) int {
 		if i%100 == 1 {
 			p.LatencyMs = int(2 * o.visibility.Milliseconds()) // outlives the visibility timeout; needs heartbeats
 		}
-		if _, err := q.Enqueue(ctx, task, p, queue.EnqueueOptions{MaxAttempts: maxAttempts}); err != nil {
+		opts := queue.EnqueueOptions{MaxAttempts: maxAttempts, IdempotencyKey: fmt.Sprintf("job-%d", i)}
+		id, err := q.Enqueue(ctx, task, p, opts)
+		if err != nil {
 			log.Fatalf("enqueue: %v", err)
+		}
+		// Every 10th enqueue is retried, as if the first response was lost.
+		if i%10 == 3 {
+			again, err := q.Enqueue(ctx, task, p, opts)
+			if err != nil {
+				log.Fatalf("enqueue: %v", err)
+			}
+			if again != id {
+				log.Fatalf("retried enqueue of job %d created a second job (%s, %s)", i, id, again)
+			}
 		}
 	}
 
@@ -471,6 +499,30 @@ func (c *controller) report(ctx context.Context, rdb *redis.Client, store *redis
 		}
 	}
 
+	// Every job that wasn't dead-lettered must have had its effect applied
+	// exactly once; a dead-lettered one at most once.
+	effects := map[int]int{}
+	raw, err := rdb.HGetAll(ctx, c.o.prefix+"ds:effects").Result()
+	if err != nil {
+		log.Fatalf("read effects: %v", err)
+	}
+	for k, v := range raw {
+		n, _ := strconv.Atoi(k)
+		effects[n], _ = strconv.Atoi(v)
+	}
+	var duplicateEffects, missingEffects []int
+	for id := range c.o.jobs {
+		_, isDead := deadReason[id]
+		switch {
+		case effects[id] > 1:
+			duplicateEffects = append(duplicateEffects, id)
+		case effects[id] == 0 && !isDead:
+			missingEffects = append(missingEffects, id)
+		}
+	}
+	outcomes, _ := rdb.HGetAll(ctx, c.o.prefix+"ds:outcomes").Result()
+	consumers, _ := rdb.XInfoConsumers(ctx, c.o.prefix+"jobs", c.o.prefix+"workers").Result()
+
 	st, _ := store.Stats(ctx)
 	leaseLost, _ := rdb.Get(ctx, leaseLostKey(c.o.prefix)).Int()
 	leftover := st.StreamLength + st.InFlight + st.RetryScheduled
@@ -482,7 +534,7 @@ func (c *controller) report(ctx context.Context, rdb *redis.Client, store *redis
 		return "FAIL"
 	}
 	fmt.Printf("  faults injected: %d SIGKILLs, %d SIGSTOP pauses, elapsed %s\n\n", c.kills, c.pauses, elapsed.Round(100*time.Millisecond))
-	fmt.Printf("  %-34s %7d\n", "jobs enqueued", c.o.jobs)
+	fmt.Printf("  %-34s %7d  (%d enqueues retried and deduped)\n", "jobs enqueued", c.o.jobs, (c.o.jobs+6)/10)
 	fmt.Printf("  %-34s %7d\n", "completed", completed)
 	fmt.Printf("  %-34s %7d\n", "dead-lettered (permanent failures)", deadExpected)
 	for reason, n := range otherDead {
@@ -492,9 +544,16 @@ func (c *controller) report(ctx context.Context, rdb *redis.Client, store *redis
 	fmt.Printf("  %-34s %7d  %s\n", "permanent failures misrouted", len(misrouted), ok(len(misrouted) == 0))
 	fmt.Printf("  %-34s %7d  %s (stream %d, pending %d, scheduled %d)\n", "left in queue", leftover, ok(leftover == 0),
 		st.StreamLength, st.InFlight, st.RetryScheduled)
-	fmt.Printf("  %-34s %7d  crashed or paused between side effect and ack\n", "duplicate executions", duplicates)
+	fmt.Printf("  %-34s %7d  %s\n", "jobs with duplicate side effects", len(duplicateEffects), ok(len(duplicateEffects) == 0))
+	fmt.Printf("  %-34s %7d  %s\n", "jobs missing their effect", len(missingEffects), ok(len(missingEffects) == 0))
+	fmt.Printf("\n  at-least-once delivery, absorbed downstream:\n")
+	fmt.Printf("  %-34s %7d  crashed or paused between side effect and ack\n", "duplicate runs", duplicates)
 	fmt.Printf("  %-34s %7d  ran concurrently; only paused zombies should do this\n", "jobs with overlapping runs", overlapping)
-	fmt.Printf("  %-34s %7d  stale results fenced off by lease checks\n", "zombie results rejected", leaseLost)
+	count := func(k string) int { n, _ := strconv.Atoi(outcomes[k]); return n }
+	fmt.Printf("  %-34s %7d  same job ID applied again\n", "effects deduped by job ID", count("deduped"))
+	fmt.Printf("  %-34s %7d  stale fencing token\n", "effects rejected by fencing", count("fenced"))
+	fmt.Printf("  %-34s %7d  stale results fenced off by lease checks\n", "zombie queue updates rejected", leaseLost)
+	fmt.Printf("  %-34s %7d  killed workers not yet pruned\n", "consumers left in group", len(consumers))
 	c.mu.Lock()
 	for _, crash := range c.crashed {
 		fmt.Printf("  worker exited unexpectedly: %s\n", crash)
@@ -505,7 +564,10 @@ func (c *controller) report(ctx context.Context, rdb *redis.Client, store *redis
 	if len(lost) > 0 {
 		fmt.Printf("\n  first lost jobs (payload n): %v\n", lost[:min(5, len(lost))])
 	}
-	if len(lost) > 0 || len(misrouted) > 0 || leftover > 0 || crashed > 0 {
+	if len(duplicateEffects) > 0 {
+		fmt.Printf("  first jobs with duplicate effects (payload n): %v\n", duplicateEffects[:min(5, len(duplicateEffects))])
+	}
+	if len(lost) > 0 || len(misrouted) > 0 || leftover > 0 || crashed > 0 || len(duplicateEffects) > 0 || len(missingEffects) > 0 {
 		fmt.Println("\nFAIL")
 		return 1
 	}

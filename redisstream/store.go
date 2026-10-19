@@ -20,6 +20,10 @@ type Config struct {
 	Group      string
 	RetryKey   string // sorted set of scheduled job IDs (retries and delayed jobs), scored by run-at unix ms
 	DeadLetter string
+	// DedupePrefix and DedupeWindow control enqueue idempotency keys: a key is
+	// remembered at DedupePrefix+key for DedupeWindow. Defaults: "dtq:dedupe:", 24h.
+	DedupePrefix string
+	DedupeWindow time.Duration
 	// ConsumerIdleTimeout is how long a consumer can hold nothing and go
 	// without reading before it's removed from the group. Defaults to 1h.
 	ConsumerIdleTimeout time.Duration
@@ -52,6 +56,12 @@ func New(config Config) (*Store, error) {
 	}
 	if config.DeadLetter == "" {
 		config.DeadLetter = "dtq:dead"
+	}
+	if config.DedupePrefix == "" {
+		config.DedupePrefix = "dtq:dedupe:"
+	}
+	if config.DedupeWindow <= 0 {
+		config.DedupeWindow = 24 * time.Hour
 	}
 	if config.ConsumerIdleTimeout <= 0 {
 		config.ConsumerIdleTimeout = time.Hour
@@ -99,6 +109,9 @@ func (b *Store) Enqueue(ctx context.Context, job queue.Job) (queue.JobID, error)
 	if job.ID == "" {
 		job.ID = queue.NewJobID()
 	}
+	if job.IdempotencyKey != "" {
+		return b.enqueueOnce(ctx, job)
+	}
 
 	// Delayed jobs wait in the retry schedule until they're due.
 	if job.AvailableAt.After(time.Now()) {
@@ -116,6 +129,21 @@ func (b *Store) Enqueue(ctx context.Context, job queue.Job) (queue.JobID, error)
 		return "", err
 	}
 	return job.ID, nil
+}
+
+func (b *Store) enqueueOnce(ctx context.Context, job queue.Job) (queue.JobID, error) {
+	data, err := json.Marshal(jobFields(job))
+	if err != nil {
+		return "", err
+	}
+	var runAt int64
+	if job.AvailableAt.After(time.Now()) {
+		runAt = job.AvailableAt.UnixMilli()
+	}
+	id, err := enqueueOnceScript.Run(ctx, b.rds,
+		[]string{b.config.DedupePrefix + job.IdempotencyKey, b.config.Stream, b.config.RetryKey, b.retryData},
+		string(job.ID), b.config.DedupeWindow.Milliseconds(), runAt, data).Text()
+	return queue.JobID(id), err
 }
 
 func (b *Store) schedule(ctx context.Context, job queue.Job, runAt time.Time) error {

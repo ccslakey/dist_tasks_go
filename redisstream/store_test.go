@@ -21,11 +21,12 @@ func newTestStore(t *testing.T) *Store {
 	// don't collide on the default dtq:* keys.
 	prefix := "test:" + strings.ReplaceAll(t.Name(), "/", "_") + ":"
 	store, err := New(Config{
-		Addr:       inst.Addr,
-		Stream:     prefix + "jobs",
-		Group:      prefix + "workers",
-		RetryKey:   prefix + "retry",
-		DeadLetter: prefix + "dead",
+		Addr:         inst.Addr,
+		Stream:       prefix + "jobs",
+		Group:        prefix + "workers",
+		RetryKey:     prefix + "retry",
+		DeadLetter:   prefix + "dead",
+		DedupePrefix: prefix + "dedupe:",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -330,5 +331,46 @@ func TestConsumerCleanupKeepsConsumersWithPendingJobs(t *testing.T) {
 	}
 	if consumers, _ := store.rds.XInfoConsumers(ctx, store.config.Stream, store.config.Group).Result(); len(consumers) != 0 {
 		t.Errorf("consumers after deregistering an empty one = %+v, want none", consumers)
+	}
+}
+
+func TestIdempotentEnqueue(t *testing.T) {
+	store := newTestStore(t)
+	ctx := t.Context()
+
+	for _, delay := range []time.Duration{0, time.Hour} {
+		key := fmt.Sprintf("order-42-%s", delay)
+		var ids []queue.JobID
+		// Concurrent retries of the same enqueue, e.g. after a timeout.
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for range 10 {
+			wg.Go(func() {
+				job := newJob(3)
+				job.AvailableAt = time.Now().Add(delay)
+				job.IdempotencyKey = key
+				id, err := store.Enqueue(ctx, job)
+				if err != nil {
+					t.Errorf("Enqueue: %v", err)
+				}
+				mu.Lock()
+				ids = append(ids, id)
+				mu.Unlock()
+			})
+		}
+		wg.Wait()
+		for _, id := range ids {
+			if id != ids[0] {
+				t.Fatalf("delay %s: enqueues with one key returned different IDs %v", delay, ids)
+			}
+		}
+	}
+
+	stats, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.StreamLength != 1 || stats.RetryScheduled != 1 {
+		t.Errorf("stream=%d scheduled=%d, want one job each", stats.StreamLength, stats.RetryScheduled)
 	}
 }
