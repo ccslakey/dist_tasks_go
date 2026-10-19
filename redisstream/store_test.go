@@ -433,3 +433,37 @@ func TestExtendBatchFencesEachJob(t *testing.T) {
 		t.Errorf("recovered %v, want only the job whose lease wasn't renewed", recovered)
 	}
 }
+
+func TestEnqueueBatch(t *testing.T) {
+	store := newTestStore(t)
+	ctx := t.Context()
+
+	keyed := newJob(3)
+	keyed.IdempotencyKey = "order-7"
+	firstID, err := store.Enqueue(ctx, keyed)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	delayed := newJob(3)
+	delayed.AvailableAt = time.Now().Add(time.Hour)
+	again := newJob(3)
+	again.IdempotencyKey = "order-7"
+	batch := []queue.Job{newJob(3), newJob(3), delayed, again}
+	ids, err := store.EnqueueBatch(ctx, batch)
+	if err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+	if len(ids) != 4 || ids[3] != firstID {
+		t.Fatalf("ids = %v, want 4 with the keyed one deduped to %s", ids, firstID)
+	}
+
+	stats, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	// 1 earlier keyed job + 2 immediate; the delayed one is scheduled.
+	if stats.StreamLength != 3 || stats.RetryScheduled != 1 {
+		t.Errorf("stream=%d scheduled=%d, want 3 and 1", stats.StreamLength, stats.RetryScheduled)
+	}
+}

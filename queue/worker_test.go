@@ -372,3 +372,18 @@ func (f *fakeBackend) deadLettered() map[JobID]string {
 	defer f.mu.Unlock()
 	return f.dead
 }
+
+func TestEnqueueBatchFallsBackToSingleEnqueues(t *testing.T) {
+	backend := &fakeBackend{}
+	ids, err := New(backend).EnqueueBatch(t.Context(), []EnqueueRequest{
+		{Task: "email", Payload: 1},
+		{Task: "email", Payload: 2},
+		{Task: "image", Payload: 3},
+	})
+	if err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+	if len(ids) != 3 || len(backend.ready) != 3 || backend.ready[2].ID != ids[2] {
+		t.Fatalf("ids=%v ready=%d, want 3 jobs in order", ids, len(backend.ready))
+	}
+}

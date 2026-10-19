@@ -131,6 +131,61 @@ func (b *Store) Enqueue(ctx context.Context, job queue.Job) (queue.JobID, error)
 	return job.ID, nil
 }
 
+// EnqueueBatch enqueues jobs in one round trip as a MULTI/EXEC transaction,
+// so either all of them are stored or none are. Jobs with idempotency keys
+// go through the same dedupe script as Enqueue.
+func (b *Store) EnqueueBatch(ctx context.Context, jobs []queue.Job) ([]queue.JobID, error) {
+	// Scripts run inside MULTI by SHA, so make sure Redis has this one.
+	if err := enqueueOnceScript.Load(ctx, b.rds).Err(); err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	results := make([]*redis.Cmd, len(jobs))
+	_, err := b.rds.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		for i := range jobs {
+			job := &jobs[i]
+			if job.ID == "" {
+				job.ID = queue.NewJobID()
+			}
+			data, err := json.Marshal(jobFields(*job))
+			if err != nil {
+				return err
+			}
+			var runAt int64
+			if job.AvailableAt.After(now) {
+				runAt = job.AvailableAt.UnixMilli()
+			}
+			switch {
+			case job.IdempotencyKey != "":
+				results[i] = enqueueOnceScript.EvalSha(ctx, p,
+					[]string{b.config.DedupePrefix + job.IdempotencyKey, b.config.Stream, b.config.RetryKey, b.retryData},
+					string(job.ID), b.config.DedupeWindow.Milliseconds(), runAt, data)
+			case runAt > 0:
+				p.HSet(ctx, b.retryData, string(job.ID), data)
+				p.ZAdd(ctx, b.config.RetryKey, redis.Z{Score: float64(runAt), Member: string(job.ID)})
+			default:
+				p.XAdd(ctx, &redis.XAddArgs{Stream: b.config.Stream, Values: jobFields(*job)})
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]queue.JobID, len(jobs))
+	for i, job := range jobs {
+		ids[i] = job.ID
+		if results[i] != nil {
+			id, err := results[i].Text()
+			if err != nil {
+				return nil, err
+			}
+			ids[i] = queue.JobID(id)
+		}
+	}
+	return ids, nil
+}
+
 func (b *Store) enqueueOnce(ctx context.Context, job queue.Job) (queue.JobID, error) {
 	data, err := json.Marshal(jobFields(job))
 	if err != nil {

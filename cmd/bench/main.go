@@ -48,6 +48,7 @@ type options struct {
 	rate         int
 	latencyJobs  int
 	producers    int
+	enqueueBatch int
 
 	// Worker-process flags, set by the controller.
 	worker   bool
@@ -69,6 +70,7 @@ func main() {
 	flag.IntVar(&o.rate, "rate", 200, "jobs per second for the latency test")
 	flag.IntVar(&o.latencyJobs, "latency-jobs", 1000, "jobs to send in the latency test")
 	flag.IntVar(&o.producers, "producers", 32, "concurrent enqueuers when building the backlog")
+	flag.IntVar(&o.enqueueBatch, "enqueue-batch", 100, "jobs per EnqueueBatch call when building the backlog (1 = single Enqueue calls)")
 	flag.BoolVar(&o.worker, "worker", false, "")
 	flag.StringVar(&o.workerID, "worker-id", "", "")
 	flag.StringVar(&o.prefix, "prefix", "", "")
@@ -101,8 +103,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("%d jobs, concurrency %d per worker process, poll interval %s, latency test at %d jobs/s\n\n",
-		o.jobs, o.concurrency, o.pollInterval, o.rate)
+	fmt.Printf("%d jobs, concurrency %d per worker process, enqueue batches of %d, poll interval %s, latency test at %d jobs/s\n\n",
+		o.jobs, o.concurrency, o.enqueueBatch, o.pollInterval, o.rate)
 	fmt.Println("| mode | workers | throughput (jobs/s) | redis cpu | enqueue (jobs/s) | pickup p50 | pickup p95 | pickup p99 |")
 	fmt.Println("|---|---|---|---|---|---|---|---|")
 	for _, mode := range o.modes {
@@ -246,6 +248,35 @@ func (c *controller) enqueue(store *redisstream.Store, n int) time.Duration {
 	return time.Since(start)
 }
 
+// enqueueBatched builds the backlog with EnqueueBatch calls.
+func (c *controller) enqueueBatched(store *redisstream.Store, n int) time.Duration {
+	q := queue.New(store)
+	start := time.Now()
+	var wg sync.WaitGroup
+	next := make(chan int)
+	go func() {
+		for i := 0; i < n; i += c.o.enqueueBatch {
+			next <- i
+		}
+		close(next)
+	}()
+	for range c.o.producers {
+		wg.Go(func() {
+			for first := range next {
+				reqs := make([]queue.EnqueueRequest, 0, c.o.enqueueBatch)
+				for i := first; i < min(first+c.o.enqueueBatch, n); i++ {
+					reqs = append(reqs, queue.EnqueueRequest{Task: "noop", Payload: i})
+				}
+				if _, err := q.EnqueueBatch(context.Background(), reqs); err != nil {
+					log.Fatalf("enqueue: %v", err)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	return time.Since(start)
+}
+
 func (c *controller) throughput() throughputResult {
 	c.start(false)
 	defer c.stop()
@@ -255,7 +286,11 @@ func (c *controller) throughput() throughputResult {
 	}
 	defer store.Close()
 
-	enqueueTime := c.enqueue(store, c.o.jobs)
+	enqueue := c.enqueueBatched
+	if c.o.enqueueBatch <= 1 {
+		enqueue = c.enqueue
+	}
+	enqueueTime := enqueue(store, c.o.jobs)
 	cpuBefore := redisCPU(c.rdb)
 	start := time.Now()
 	c.release()

@@ -43,9 +43,93 @@ func New(backend Backend, opts ...QueueOption) *Queue {
 }
 
 func (q *Queue) Enqueue(ctx context.Context, task string, payload any, opts EnqueueOptions) (JobID, error) {
-	raw, err := json.Marshal(payload)
+	job, err := q.newJob(task, payload, opts)
 	if err != nil {
 		return "", err
+	}
+
+	ctx, span := startEnqueueSpan(ctx, &job)
+	defer span.End()
+	id, err := q.backend.Enqueue(ctx, job)
+	if err != nil {
+		setOutcome(ctx, "failed", err)
+		return "", err
+	}
+	if id == job.ID {
+		q.metrics.JobEnqueued(ctx, job)
+		setOutcome(ctx, "enqueued", nil)
+	} else {
+		setOutcome(ctx, "duplicate", nil) // an earlier enqueue used the same idempotency key
+	}
+	return id, nil
+}
+
+// EnqueueRequest is one job for EnqueueBatch.
+type EnqueueRequest struct {
+	Task    string
+	Payload any
+	Options EnqueueOptions
+}
+
+// EnqueueBatch enqueues several jobs in one round trip when the backend
+// supports it, all or nothing. It returns one ID per request; a request whose
+// idempotency key was already used gets the original job's ID. All jobs in
+// the batch share one trace span.
+func (q *Queue) EnqueueBatch(ctx context.Context, reqs []EnqueueRequest) ([]JobID, error) {
+	jobs := make([]Job, len(reqs))
+	for i, r := range reqs {
+		job, err := q.newJob(r.Task, r.Payload, r.Options)
+		if err != nil {
+			return nil, err
+		}
+		jobs[i] = job
+	}
+	if len(jobs) == 0 {
+		return nil, nil
+	}
+
+	ctx, span := startEnqueueSpan(ctx, &jobs[0])
+	defer span.End()
+	for i := range jobs[1:] {
+		jobs[i+1].TraceParent = jobs[0].TraceParent
+	}
+
+	var ids []JobID
+	if b, ok := q.backend.(batchEnqueuer); ok {
+		var err error
+		if ids, err = b.EnqueueBatch(ctx, jobs); err != nil {
+			setOutcome(ctx, "failed", err)
+			return nil, err
+		}
+	} else {
+		for _, job := range jobs {
+			id, err := q.backend.Enqueue(ctx, job)
+			if err != nil {
+				setOutcome(ctx, "failed", err)
+				return ids, err
+			}
+			ids = append(ids, id)
+		}
+	}
+	for i, job := range jobs {
+		if ids[i] == job.ID {
+			q.metrics.JobEnqueued(ctx, job)
+		}
+	}
+	setOutcome(ctx, "enqueued", nil)
+	return ids, nil
+}
+
+// batchEnqueuer is implemented by backends that can enqueue many jobs in one
+// round trip, all or nothing.
+type batchEnqueuer interface {
+	EnqueueBatch(ctx context.Context, jobs []Job) ([]JobID, error)
+}
+
+func (q *Queue) newJob(task string, payload any, opts EnqueueOptions) (Job, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return Job{}, err
 	}
 
 	maxAttempts := opts.MaxAttempts
@@ -65,21 +149,7 @@ func (q *Queue) Enqueue(ctx context.Context, task string, payload any, opts Enqu
 		IdempotencyKey: opts.IdempotencyKey,
 	}
 	if err := job.Validate(); err != nil {
-		return "", err
+		return Job{}, err
 	}
-
-	ctx, span := startEnqueueSpan(ctx, &job)
-	defer span.End()
-	id, err := q.backend.Enqueue(ctx, job)
-	if err != nil {
-		setOutcome(ctx, "failed", err)
-		return "", err
-	}
-	if id == job.ID {
-		q.metrics.JobEnqueued(ctx, job)
-		setOutcome(ctx, "enqueued", nil)
-	} else {
-		setOutcome(ctx, "duplicate", nil) // an earlier enqueue used the same idempotency key
-	}
-	return id, nil
+	return job, nil
 }
