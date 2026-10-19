@@ -110,6 +110,23 @@ go run ./cmd/bench
 - **Group-committed acks raised throughput ~25–30%** (30k → 40k jobs/s at 8 workers). Acks that arrive while a batch is in flight go out together in one Lua call. At low load each batch has one ack, so it costs no latency.
 - **The ceiling is the client, not Redis.** At 40k jobs/s Redis spends about 12µs of CPU per job, so it's roughly 35% busy. The workers and the benchmark share one process on the same laptop as Redis, which is what flattens scaling past 4 workers. Separate worker machines would push further.
 
+## Live Demo
+
+```sh
+docker compose up -d --build     # Redis, 3 workers, a producer, Prometheus, Grafana, Jaeger
+open http://localhost:3000       # Grafana dashboard (no login)
+./scripts/kill-worker.sh         # SIGKILL a random worker mid-job; a replacement starts
+./scripts/kill-worker.sh -pause 10   # freeze one past its 5s lease so it comes back as a zombie
+open http://localhost:16686      # Jaeger: service dtq-worker, operation "process flaky_email"
+docker compose down
+```
+
+If something already uses a port (say, a local Redis on 6379), override it: `REDIS_PORT=6380 docker compose up -d --build`. `PROMETHEUS_PORT`, `GRAFANA_PORT`, and `JAEGER_PORT` work the same way.
+
+The producer sends a mix of jobs at ~50/s: mostly successes, some that fail twice before succeeding, and a few that always fail. Kill a worker and you'll see its line drop out of "Jobs started per worker" while the others absorb its jobs. Freeze one and its stale results show up under "Leases lost" when it wakes. In Jaeger, one trace holds a job's enqueue and every attempt, across the producer and worker processes.
+
+![Grafana dashboard](docs/dashboard.png)
+
 ## Run Locally
 
 Start Redis:

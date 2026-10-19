@@ -94,3 +94,22 @@ func TestStartTimesGrowWithoutTerminalCallback(t *testing.T) {
 		t.Errorf("after %d JobStarted with no terminal callback: %d entries, want %d (this test exists to make the leak visible)", n, got, n)
 	}
 }
+
+// The first lease lost for a task must be visible to rate(), which needs the
+// series to exist (at zero) before the increment.
+func TestOutcomeSeriesExistBeforeFirstIncrement(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+	m.JobStarted(t.Context(), queue.Job{ID: "job-1", Task: "email"})
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() == "dtq_job_leases_lost_total" {
+			return
+		}
+	}
+	t.Error("dtq_job_leases_lost_total has no series for a task that has started jobs")
+}

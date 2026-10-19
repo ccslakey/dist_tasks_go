@@ -23,7 +23,13 @@ go run ./cmd/chaos
 
 # Throughput and pickup-latency benchmark
 go run ./cmd/bench
+
+# Full demo stack (workers, producer, Prometheus :9090, Grafana :3000, Jaeger :16686)
+docker compose up -d --build
+./scripts/kill-worker.sh [-pause N]
 ```
+
+The Grafana dashboard is generated JSON in `deploy/grafana/dashboards/dtq.json`; Prometheus finds worker replicas via Docker DNS (`deploy/prometheus.yml`). Demo binaries read `DTQ_REDIS_ADDR` and export traces when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
 ## Architecture
 

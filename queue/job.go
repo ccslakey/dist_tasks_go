@@ -19,14 +19,14 @@ func NewJobID() JobID {
 }
 
 type Job struct {
-	ID          JobID           `json:"id"`           // stable logical ID, assigned once at enqueue
-	Task        string          `json:"task"`         // stored/retrieved as a plain string field
-	Payload     json.RawMessage `json:"payload"`      // stored as string(payload); cast back with json.RawMessage(s)
-	Attempt     int             `json:"attempt"`      // number of previous failed attempts (0 on the first run)
-	MaxAttempts int             `json:"max_attempts"` // total runs allowed before the job is dead-lettered
+	ID          JobID           `json:"id"`                     // stable logical ID, assigned once at enqueue
+	Task        string          `json:"task"`                   // stored/retrieved as a plain string field
+	Payload     json.RawMessage `json:"payload"`                // stored as string(payload); cast back with json.RawMessage(s)
+	Attempt     int             `json:"attempt"`                // number of previous failed attempts (0 on the first run)
+	MaxAttempts int             `json:"max_attempts"`           // total runs allowed before the job is dead-lettered
 	TraceParent string          `json:"trace_parent,omitempty"` // W3C traceparent of the enqueue span
-	CreatedAt   time.Time       `json:"created_at"`   // store/parse as time.RFC3339Nano
-	AvailableAt time.Time       `json:"available_at"` // store/parse as time.RFC3339Nano
+	CreatedAt   time.Time       `json:"created_at"`             // store/parse as time.RFC3339Nano
+	AvailableAt time.Time       `json:"available_at"`           // store/parse as time.RFC3339Nano
 
 	// IdempotencyKey, if set at enqueue, makes the enqueue idempotent: another
 	// enqueue with the same key inside the backend's dedupe window returns the

@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  # Every worker replica, found through Docker's DNS for the service name.
+  - job_name: dtq-workers
+    dns_sd_configs:
+      - names: [worker]
+        type: A
+        port: 9090
+        refresh_interval: 2s
+  - job_name: dtq-producer
+    static_configs:
+      - targets: ["producer:9100"]

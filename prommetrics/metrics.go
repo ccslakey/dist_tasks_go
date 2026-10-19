@@ -30,6 +30,8 @@ type Metrics struct {
 	deadLettered *prometheus.CounterVec
 	leaseLost    *prometheus.CounterVec
 	duration     *prometheus.HistogramVec
+	pickup       *prometheus.HistogramVec
+	endToEnd     *prometheus.HistogramVec
 
 	streamLength    prometheus.Gauge
 	inFlight        prometheus.Gauge
@@ -39,6 +41,8 @@ type Metrics struct {
 	// startTimes tracks per-delivery start timestamps so the terminal
 	// callbacks can observe duration. Keyed by startKey.
 	startTimes sync.Map
+
+	initialized sync.Map // tasks whose outcome series have been created
 }
 
 // startKey identifies one delivery: the same job can be redelivered while an
@@ -93,6 +97,16 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help:    "Handler runtime in seconds, partitioned by task.",
 			Buckets: prometheus.DefBuckets, // 5ms .. 10s; tune per workload
 		}, []string{taskLabel}),
+		pickup: factory.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "dtq_job_pickup_seconds",
+			Help:    "Time from when a job became runnable to its first run starting, partitioned by task.",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 14), // 1ms .. 8s
+		}, []string{taskLabel}),
+		endToEnd: factory.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "dtq_job_end_to_end_seconds",
+			Help:    "Time from enqueue to successful completion, including retries, partitioned by task.",
+			Buckets: prometheus.ExponentialBuckets(0.01, 2, 14), // 10ms .. 80s
+		}, []string{taskLabel}),
 
 		streamLength: factory.NewGauge(prometheus.GaugeOpts{
 			Name: "dtq_stream_length",
@@ -118,9 +132,28 @@ func (m *Metrics) JobEnqueued(_ context.Context, job queue.Job) {
 	m.enqueued.WithLabelValues(job.Task).Inc()
 }
 
+// initTask creates a task's outcome series at zero. A labeled counter only
+// appears when first incremented, and rate()/increase() need a prior sample,
+// so without this the first lease lost or dead-letter for a task is invisible.
+func (m *Metrics) initTask(task string) {
+	if _, loaded := m.initialized.LoadOrStore(task, true); loaded {
+		return
+	}
+	m.completed.WithLabelValues(task)
+	m.failed.WithLabelValues(task, "true")
+	m.failed.WithLabelValues(task, "false")
+	m.retried.WithLabelValues(task)
+	m.deadLettered.WithLabelValues(task)
+	m.leaseLost.WithLabelValues(task)
+}
+
 func (m *Metrics) JobStarted(_ context.Context, job queue.Job) {
+	m.initTask(job.Task)
 	// stash time.Now() so JobCompleted/JobFailed can call duration.Observe.
 	m.startTimes.Store(keyOf(job), time.Now())
+	if job.Attempt == 0 && job.Lease.Token == 1 { // first run only; later runs include backoff or recovery time
+		m.pickup.WithLabelValues(job.Task).Observe(time.Since(job.AvailableAt).Seconds())
+	}
 	m.started.WithLabelValues(job.Task).Inc()
 }
 
@@ -129,6 +162,7 @@ func (m *Metrics) JobCompleted(_ context.Context, job queue.Job) {
 		m.duration.WithLabelValues(job.Task).Observe(time.Since(start.(time.Time)).Seconds())
 	}
 	m.completed.WithLabelValues(job.Task).Inc()
+	m.endToEnd.WithLabelValues(job.Task).Observe(time.Since(job.CreatedAt).Seconds())
 }
 
 func (m *Metrics) JobFailed(_ context.Context, job queue.Job, retryable bool) {

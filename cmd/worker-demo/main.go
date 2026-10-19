@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,9 +23,11 @@ import (
 
 func main() {
 	host, _ := os.Hostname()
-	id := flag.String("id", fmt.Sprintf("%s-%d", host, os.Getpid()), "worker ID; must be unique per running worker")
+	// The random suffix keeps IDs unique even where PIDs repeat (PID 1 in every container).
+	id := flag.String("id", fmt.Sprintf("%s-%d-%04x", host, os.Getpid(), rand.IntN(1<<16)), "worker ID; must be unique per running worker")
 	metricsAddr := flag.String("metrics-addr", ":9090", "address for the /metrics endpoint (empty disables it)")
 	concurrency := flag.Int("concurrency", 4, "max jobs this worker runs at once")
+	visibility := flag.Duration("visibility", 30*time.Second, "how long a job's lease can go without a heartbeat before other workers recover it")
 	redisAddr := flag.String("redis", envOr("DTQ_REDIS_ADDR", "localhost:6379"), "Redis address")
 	flag.Parse()
 
@@ -62,7 +65,7 @@ func main() {
 		ID:                *id,
 		Concurrency:       *concurrency,
 		PollInterval:      250 * time.Millisecond,
-		VisibilityTimeout: 30 * time.Second,
+		VisibilityTimeout: *visibility,
 		RetryPolicy:       queue.DefaultRetryPolicy(),
 	}, m)
 
