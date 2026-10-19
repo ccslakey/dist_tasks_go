@@ -9,6 +9,9 @@ type Metrics interface {
 	JobFailed(ctx context.Context, job Job, retryable bool)
 	JobRetried(ctx context.Context, job Job)
 	JobDeadLettered(ctx context.Context, job Job)
+	// JobLeaseLost is called when a worker finds that another worker took
+	// over a job it was running, so its result was discarded.
+	JobLeaseLost(ctx context.Context, job Job)
 	StatsObserved(ctx context.Context, stats Stats)
 }
 
@@ -20,4 +23,5 @@ func (NoopMetrics) JobCompleted(context.Context, Job)    {}
 func (NoopMetrics) JobFailed(context.Context, Job, bool) {}
 func (NoopMetrics) JobRetried(context.Context, Job)      {}
 func (NoopMetrics) JobDeadLettered(context.Context, Job) {}
+func (NoopMetrics) JobLeaseLost(context.Context, Job)    {}
 func (NoopMetrics) StatsObserved(context.Context, Stats) {}

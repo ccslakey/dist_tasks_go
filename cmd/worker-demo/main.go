@@ -7,6 +7,7 @@ import (
 	"dist_tasks_go/prommetrics"
 	"dist_tasks_go/queue"
 	"dist_tasks_go/redisstream"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -19,6 +20,12 @@ import (
 )
 
 func main() {
+	host, _ := os.Hostname()
+	id := flag.String("id", fmt.Sprintf("%s-%d", host, os.Getpid()), "worker ID; must be unique per running worker")
+	metricsAddr := flag.String("metrics-addr", ":9090", "address for the /metrics endpoint (empty disables it)")
+	concurrency := flag.Int("concurrency", 4, "max jobs this worker runs at once")
+	flag.Parse()
+
 	slog.SetDefault(slog.New(prettylog.NewHandler(os.Stdout)))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -27,21 +34,24 @@ func main() {
 	backend, err := redisstream.New(redisstream.Config{})
 	if err != nil {
 		slog.Error(err.Error())
+		os.Exit(1)
 	}
 
 	m := prommetrics.New(nil)
 
-	http.Handle("/metrics", promhttp.Handler())
-	go func() {
-		slog.Info("metrics listening on :9090/metrics")
-		if err := http.ListenAndServe(":9090", nil); err != nil {
-			slog.Error(fmt.Sprintf("metrics server: %v", err))
-		}
-	}()
+	if *metricsAddr != "" {
+		http.Handle("/metrics", promhttp.Handler())
+		go func() {
+			slog.Info("metrics listening", "addr", *metricsAddr)
+			if err := http.ListenAndServe(*metricsAddr, nil); err != nil {
+				slog.Error(fmt.Sprintf("metrics server: %v", err))
+			}
+		}()
+	}
 
 	worker := queue.NewWorker(backend, queue.WorkerConfig{
-		ID:                "worker-demo-1",
-		Concurrency:       4,
+		ID:                *id,
+		Concurrency:       *concurrency,
 		PollInterval:      250 * time.Millisecond,
 		VisibilityTimeout: 30 * time.Second,
 		RetryPolicy:       queue.DefaultRetryPolicy(),
@@ -60,6 +70,7 @@ func main() {
 		slog.Error(err.Error())
 	}
 
+	slog.Info("worker started", "id", *id, "concurrency", *concurrency)
 	if err := worker.Run(ctx); err != nil && err != context.Canceled {
 		slog.Error(err.Error())
 	}

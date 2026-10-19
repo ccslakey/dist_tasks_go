@@ -4,10 +4,11 @@ import (
 	"context"
 	"dist_tasks_go/queue"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -17,13 +18,19 @@ type Config struct {
 	Addr       string
 	Stream     string
 	Group      string
-	RetryKey   string
+	RetryKey   string // sorted set of scheduled job IDs (retries and delayed jobs), scored by run-at unix ms
 	DeadLetter string
 }
 
 type Store struct {
 	config Config
 	rds    *redis.Client
+	// retryData holds the fields of each scheduled job, keyed by job ID.
+	retryData string
+
+	// recoverCursor is where the next RecoverExpired scan resumes in the PEL.
+	mu            sync.Mutex
+	recoverCursor string
 }
 
 func New(config Config) (*Store, error) {
@@ -49,237 +56,278 @@ func New(config Config) (*Store, error) {
 		Protocol: 2,
 	})
 
-	_, err := rdsCli.XGroupCreateMkStream(context.Background(), config.Stream, config.Group, "$").Result()
+	// "0" rather than "$" so entries added before the group existed still get processed.
+	_, err := rdsCli.XGroupCreateMkStream(context.Background(), config.Stream, config.Group, "0").Result()
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
 		return nil, err
 	}
 
-	return &Store{config: config, rds: rdsCli}, nil
+	return &Store{
+		config:        config,
+		rds:           rdsCli,
+		retryData:     config.RetryKey + ":jobs",
+		recoverCursor: "0-0",
+	}, nil
+}
+
+func (b *Store) Close() error {
+	return b.rds.Close()
+}
+
+// jobFields is how a job is stored in the stream and in the retry schedule.
+func jobFields(job queue.Job) map[string]string {
+	return map[string]string{
+		"id":          string(job.ID),
+		"task":        job.Task,
+		"payload":     string(job.Payload),
+		"attempt":     strconv.Itoa(job.Attempt),
+		"maxAttempts": strconv.Itoa(job.MaxAttempts),
+		"traceID":     job.TraceID,
+		"createdAt":   job.CreatedAt.Format(time.RFC3339Nano),
+		"availableAt": job.AvailableAt.Format(time.RFC3339Nano),
+	}
 }
 
 func (b *Store) Enqueue(ctx context.Context, job queue.Job) (queue.JobID, error) {
-	// Use Redis XADD against b.config.Stream.
-	// Store task, payload, attempt, max attempts,
-	// timestamps, and trace id as fields.
-	args := redis.XAddArgs{
-		Stream: b.config.Stream,
-		Values: map[string]interface{}{
-			"task":        job.Task,
-			"payload":     string(job.Payload),
-			"attempt":     job.Attempt,
-			"maxAttempts": job.MaxAttempts,
-			"traceID":     job.TraceID,
-			"createdAt":   job.CreatedAt.Format(time.RFC3339Nano),
-			"availableAt": job.AvailableAt.Format(time.RFC3339Nano),
-		},
+	if job.ID == "" {
+		job.ID = queue.NewJobID()
 	}
-	val, err := b.rds.XAdd(ctx, &args).Result()
 
-	return queue.JobID(val), err
+	// Delayed jobs wait in the retry schedule until they're due.
+	if job.AvailableAt.After(time.Now()) {
+		if err := b.schedule(ctx, job, job.AvailableAt); err != nil {
+			return "", err
+		}
+		return job.ID, nil
+	}
 
+	err := b.rds.XAdd(ctx, &redis.XAddArgs{
+		Stream: b.config.Stream,
+		Values: jobFields(job),
+	}).Err()
+	if err != nil {
+		return "", err
+	}
+	return job.ID, nil
+}
+
+func (b *Store) schedule(ctx context.Context, job queue.Job, runAt time.Time) error {
+	data, err := json.Marshal(jobFields(job))
+	if err != nil {
+		return err
+	}
+	_, err = b.rds.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		p.HSet(ctx, b.retryData, string(job.ID), data)
+		p.ZAdd(ctx, b.config.RetryKey, redis.Z{Score: float64(runAt.UnixMilli()), Member: string(job.ID)})
+		return nil
+	})
+	return err
 }
 
 func (b *Store) Claim(ctx context.Context, workerID string, limit int) ([]queue.Job, error) {
 	// Promote any due retries first so they're visible to this XREADGROUP call.
-	b.promoteRetries(ctx, 100)
+	if _, err := b.promoteRetries(ctx, 100); err != nil {
+		return nil, fmt.Errorf("promote retries: %w", err)
+	}
 
-	args := redis.XReadGroupArgs{
+	streams, err := b.rds.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    b.config.Group,
 		Consumer: workerID,
 		Count:    int64(limit),
 		Streams:  []string{b.config.Stream, ">"},
 		Block:    -1, // non-blocking; go-redis treats 0 as BLOCK 0 (block forever)
+	}).Result()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("xreadgroup for %s: %w", workerID, err)
 	}
 
-	streams, xrErr := b.rds.XReadGroup(ctx, &args).Result()
-
-	if errors.Is(xrErr, redis.Nil) {
-		return []queue.Job{}, nil
-	}
-
-	if xrErr != nil {
-		return nil, fmt.Errorf("err in xreadgroup. workerId:err %s: %w", workerID, xrErr)
-	}
-
-	// Later, combine this with retry promotion so delayed retries re-enter the stream.
 	var jobs []queue.Job
-
 	for _, s := range streams {
-
-		for _, messageJob := range s.Messages {
-			jobVals := messageJob.Values
-
-			att, attErr := strconv.Atoi(jobVals["attempt"].(string))
-			if attErr != nil {
-				return nil, fmt.Errorf("invalid attempt field for job %s: %w", messageJob.ID, attErr)
+		for _, msg := range s.Messages {
+			// A fresh delivery always has delivery count 1.
+			job, ok := b.parseOrQuarantine(ctx, msg.ID, msg.Values, queue.Lease{MessageID: msg.ID, Owner: workerID, Token: 1})
+			if ok {
+				jobs = append(jobs, job)
 			}
-			maxAtt, maxAttErr := strconv.Atoi(jobVals["maxAttempts"].(string))
-			if maxAttErr != nil {
-				return nil, fmt.Errorf("invalid max attempt field for job %s: %w", messageJob.ID, maxAttErr)
-			}
-			creatP, creatPErr := time.Parse(time.RFC3339Nano, jobVals["createdAt"].(string))
-			if creatPErr != nil {
-				return nil, fmt.Errorf("invalid created at field for job %s: %w", messageJob.ID, creatPErr)
-			}
-			avaiP, avaiPErr := time.Parse(time.RFC3339Nano, jobVals["availableAt"].(string))
-			if avaiPErr != nil {
-				return nil, fmt.Errorf("invalid available at field for job %s: %w", messageJob.ID, avaiPErr)
-			}
-			task, taskOk := jobVals["task"].(string)
-			if !taskOk {
-				return nil, fmt.Errorf("invalid task field for job %s", messageJob.ID)
-			}
-			pl, plOk := jobVals["payload"].(string)
-			if !plOk {
-				return nil, fmt.Errorf("invalid payload field for job %s", messageJob.ID)
-			}
-			tId, tIdOk := jobVals["traceID"].(string)
-			if !tIdOk {
-				return nil, fmt.Errorf("invalid trace id field for job %s", messageJob.ID)
-			}
-
-			j := queue.Job{
-				ID:          queue.JobID(messageJob.ID),
-				Task:        task,
-				Payload:     json.RawMessage(pl),
-				Attempt:     att,
-				MaxAttempts: maxAtt,
-				TraceID:     tId,
-				CreatedAt:   creatP,
-				AvailableAt: avaiP,
-			}
-
-			jobs = append(jobs, j)
 		}
 	}
-
 	return jobs, nil
 }
 
-func (b *Store) Ack(ctx context.Context, jobID queue.JobID) error {
-	// XACK after a handler succeeds.
-	_, err := b.rds.XAck(ctx, b.config.Stream, b.config.Group, string(jobID)).Result()
-	return err
+// parseOrQuarantine parses a delivered entry. An entry that can't be parsed
+// would fail the same way on every redelivery, so it goes straight to the
+// dead-letter stream with its raw fields.
+func (b *Store) parseOrQuarantine(ctx context.Context, msgID string, vals map[string]any, lease queue.Lease) (queue.Job, bool) {
+	job, err := parseJob(msgID, vals, lease)
+	if err == nil {
+		return job, true
+	}
+	pairs := []any{"reason", "malformed entry: " + err.Error()}
+	for k, v := range vals {
+		if k != "reason" {
+			pairs = append(pairs, k, v)
+		}
+	}
+	if err := b.fenced(ctx, deadLetterScript, []string{b.config.Stream, b.config.DeadLetter}, queue.Job{Lease: lease}, pairs...); err != nil {
+		slog.Warn("dead-lettering malformed entry failed", "message_id", msgID, "err", err)
+	}
+	return job, false
+}
+
+func parseJob(msgID string, vals map[string]any, lease queue.Lease) (queue.Job, error) {
+	str := func(name string) (string, error) {
+		v, ok := vals[name].(string)
+		if !ok {
+			return "", fmt.Errorf("invalid %s field for message %s", name, msgID)
+		}
+		return v, nil
+	}
+	num := func(name string) (int, error) {
+		s, err := str(name)
+		if err != nil {
+			return 0, err
+		}
+		return strconv.Atoi(s)
+	}
+	ts := func(name string) (time.Time, error) {
+		s, err := str(name)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return time.Parse(time.RFC3339Nano, s)
+	}
+
+	job := queue.Job{Lease: lease}
+	var err error
+	if job.Task, err = str("task"); err != nil {
+		return job, err
+	}
+	var payload string
+	if payload, err = str("payload"); err != nil {
+		return job, err
+	}
+	job.Payload = json.RawMessage(payload)
+	if job.Attempt, err = num("attempt"); err != nil {
+		return job, err
+	}
+	if job.MaxAttempts, err = num("maxAttempts"); err != nil {
+		return job, err
+	}
+	if job.TraceID, err = str("traceID"); err != nil {
+		return job, err
+	}
+	if job.CreatedAt, err = ts("createdAt"); err != nil {
+		return job, err
+	}
+	if job.AvailableAt, err = ts("availableAt"); err != nil {
+		return job, err
+	}
+	// Entries written before jobs had stable IDs fall back to the entry ID.
+	job.ID = queue.JobID(msgID)
+	if id, ok := vals["id"].(string); ok && id != "" {
+		job.ID = queue.JobID(id)
+	}
+	return job, nil
+}
+
+// fenced runs a lease-checked script and maps "not the owner" to ErrLeaseLost.
+func (b *Store) fenced(ctx context.Context, script *redis.Script, keys []string, job queue.Job, extra ...any) error {
+	args := append([]any{b.config.Group, job.Lease.MessageID, job.Lease.Owner, job.Lease.Token}, extra...)
+	n, err := script.Run(ctx, b.rds, keys, args...).Int()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return queue.ErrLeaseLost
+	}
+	return nil
+}
+
+func (b *Store) Ack(ctx context.Context, job queue.Job) error {
+	return b.fenced(ctx, ackScript, []string{b.config.Stream}, job)
+}
+
+func (b *Store) Extend(ctx context.Context, job queue.Job) error {
+	return b.fenced(ctx, extendScript, []string{b.config.Stream}, job)
 }
 
 func (b *Store) Retry(ctx context.Context, job queue.Job, nextRunAt time.Time) error {
-	// Schedule the job for a future retry using a Redis sorted set.
-	// - Increment job.Attempt before storing so the next execution reflects the right attempt number.
 	job.Attempt++
-
-	// - Serialize the updated job to JSON (json.Marshal).
-	jobBytes, err := json.Marshal(job)
+	data, err := json.Marshal(jobFields(job))
 	if err != nil {
 		return err
 	}
-	// - Use ZADD on b.config.RetryKey with score = nextRunAt.UnixMilli() and member = serialized job.
-	_, err = b.rds.ZAdd(ctx, b.config.RetryKey, redis.Z{
-		Score:  float64(nextRunAt.UnixMilli()),
-		Member: jobBytes,
-	}).Result()
-
-	if err != nil {
-		return err
-	}
-	// The sorted set acts as a delay queue: jobs become "due" once the current time passes their score.
-	// Claim will later promote due entries back into the main stream (see promoteRetriesScript).
-	return b.Ack(ctx, job.ID)
+	return b.fenced(ctx, retryScript,
+		[]string{b.config.Stream, b.config.RetryKey, b.retryData},
+		job, nextRunAt.UnixMilli(), string(job.ID), data)
 }
 
 func (b *Store) DeadLetter(ctx context.Context, job queue.Job, reason string) error {
-	//  Permanently record the failed job in the dead-letter stream.
-	// - Use XADD on b.config.DeadLetter (a separate stream from the main one).
-	// - Store the same fields as Enqueue, plus a "reason" field containing the failure message.
-	args := redis.XAddArgs{
-		Stream: b.config.DeadLetter,
-		Values: map[string]interface{}{
-			"task":        job.Task,
-			"payload":     string(job.Payload),
-			"attempt":     job.Attempt,
-			"maxAttempts": job.MaxAttempts,
-			"traceID":     job.TraceID,
-			"createdAt":   job.CreatedAt.Format(time.RFC3339Nano),
-			"availableAt": job.AvailableAt.Format(time.RFC3339Nano),
-			"reason":      reason,
-		},
+	fields := jobFields(job)
+	fields["reason"] = reason
+	fields["deliveries"] = strconv.FormatInt(job.Lease.Token, 10)
+	fields["failedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+	var pairs []any
+	for k, v := range fields {
+		pairs = append(pairs, k, v)
 	}
-	_, err := b.rds.XAdd(ctx, &args).Result()
-	if err != nil {
-		return err
-	}
-
-	return b.Ack(ctx, job.ID)
+	return b.fenced(ctx, deadLetterScript, []string{b.config.Stream, b.config.DeadLetter}, job, pairs...)
 }
 
-func (b *Store) RecoverExpired(ctx context.Context, visibilityTimeout time.Duration, workerID string) (int, error) {
-	// Use XPENDING/XAUTOCLAIM so jobs held by dead workers become claimable again.
-	claimArgs := redis.XAutoClaimArgs{
-		Stream:   b.config.Stream,
-		MinIdle:  visibilityTimeout,
-		Group:    b.config.Group,
-		Start:    "0-0",
-		Consumer: workerID,
+func (b *Store) RecoverExpired(ctx context.Context, visibilityTimeout time.Duration, workerID string, limit int) ([]queue.Job, error) {
+	if limit <= 0 {
+		return nil, nil
 	}
+	b.mu.Lock()
+	cursor := b.recoverCursor
+	b.mu.Unlock()
 
-	val, _, err := b.rds.XAutoClaim(ctx, &claimArgs).Result()
+	res, err := recoverScript.Run(ctx, b.rds, []string{b.config.Stream},
+		b.config.Group, workerID, visibilityTimeout.Milliseconds(), limit, cursor).Slice()
 	if err != nil {
-		return 0, err
+		return nil, err
+	}
+	if len(res) != 2 {
+		return nil, fmt.Errorf("recover: unexpected reply %v", res)
 	}
 
-	return len(val), err
+	if next, ok := res[0].(string); ok {
+		b.mu.Lock()
+		b.recoverCursor = next
+		b.mu.Unlock()
+	}
+
+	entries, _ := res[1].([]any)
+	jobs := make([]queue.Job, 0, len(entries))
+	for _, e := range entries {
+		entry, ok := e.([]any)
+		if !ok || len(entry) != 3 {
+			return nil, fmt.Errorf("recover: unexpected entry %v", e)
+		}
+		id, _ := entry[0].(string)
+		flat, _ := entry[1].([]any)
+		token, _ := entry[2].(int64)
+		vals := make(map[string]any, len(flat)/2)
+		for i := 0; i+1 < len(flat); i += 2 {
+			k, _ := flat[i].(string)
+			vals[k] = flat[i+1]
+		}
+		if job, ok := b.parseOrQuarantine(ctx, id, vals, queue.Lease{MessageID: id, Owner: workerID, Token: token}); ok {
+			jobs = append(jobs, job)
+		}
+	}
+	return jobs, nil
 }
 
-// promoteRetries moves any retry-sorted-set entries whose score (next-run time
-// in Unix ms) is <= now back into the main stream so they can be claimed again.
-// Returns the number of jobs promoted.
-//
-// Steps:
-//  1. ZRANGEBYSCORE b.config.RetryKey -inf <now-ms> LIMIT 0 limit
-//  2. For each due entry, XADD it back onto b.config.Stream
-//  3. ZREM the promoted entries from the sorted set
+// promoteRetries atomically moves schedule entries that are due back onto the
+// main stream so they can be claimed again. Returns the number promoted.
 func (b *Store) promoteRetries(ctx context.Context, limit int) (int, error) {
-	nowMs := time.Now().UTC().UnixMilli()
-	entries, err := b.rds.ZRangeArgsWithScores(ctx, redis.ZRangeArgs{
-		Key:     b.config.RetryKey,
-		Start:   "-inf",
-		Stop:    strconv.FormatInt(nowMs, 10),
-		Offset:  0,
-		Count:   int64(limit),
-		ByScore: true,
-	}).Result()
-	if err != nil {
-		return 0, err
-	}
-
-	for _, val := range entries {
-		var job queue.Job
-		if err := json.Unmarshal([]byte(val.Member.(string)), &job); err != nil {
-			return 0, err
-		}
-		vals := map[string]any{
-			"task":        job.Task,
-			"payload":     string(job.Payload),
-			"attempt":     job.Attempt,
-			"maxAttempts": job.MaxAttempts,
-			"traceID":     job.TraceID,
-			"createdAt":   job.CreatedAt.Format(time.RFC3339Nano),
-			"availableAt": job.AvailableAt.Format(time.RFC3339Nano),
-		}
-		_, err = b.rds.XAdd(ctx, &redis.XAddArgs{
-			Stream: b.config.Stream,
-			Values: vals,
-		}).Result()
-		if err != nil {
-			return 0, err
-		}
-
-		_, err = b.rds.ZRem(ctx, b.config.RetryKey, val.Member).Result()
-		if err != nil {
-			return 0, err
-		}
-	}
-
-	return len(entries), nil
+	return promoteScript.Run(ctx, b.rds,
+		[]string{b.config.RetryKey, b.retryData, b.config.Stream},
+		time.Now().UnixMilli(), limit).Int()
 }
 
 func (b *Store) Stats(ctx context.Context) (queue.Stats, error) {

@@ -14,14 +14,12 @@ func DefaultRetryPolicy() RetryPolicy {
 	}
 }
 
-// Implement exponential backoff.
+// NextDelay returns the exponential backoff before retry number attempt
+// (1-based): BaseDelay * 2^(attempt-1), capped at MaxDelay.
 func (p RetryPolicy) NextDelay(attempt int) time.Duration {
-	// - Treat attempt <= 0 as attempt 1.
 	if attempt < 1 {
 		attempt = 1
 	}
-
-	// - Fall back to BaseDelay=1s and MaxDelay=30s if the policy fields are zero.
 	if p.BaseDelay == 0 {
 		p.BaseDelay = 1 * time.Second
 	}
@@ -29,7 +27,6 @@ func (p RetryPolicy) NextDelay(attempt int) time.Duration {
 		p.MaxDelay = 30 * time.Second
 	}
 
-	// - Delay for attempt N is BaseDelay * 2^(N-1), capped at MaxDelay.
 	calcDelay := p.BaseDelay
 	for i := 1; i < attempt; i++ {
 		calcDelay *= 2
@@ -41,6 +38,7 @@ func (p RetryPolicy) NextDelay(attempt int) time.Duration {
 	return calcDelay
 }
 
+// ShouldDeadLetter reports whether a failed job has used all its attempts.
 func ShouldDeadLetter(job Job) bool {
 	return job.Exhausted()
 }

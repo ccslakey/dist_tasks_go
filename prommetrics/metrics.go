@@ -28,6 +28,7 @@ type Metrics struct {
 	failed       *prometheus.CounterVec // labeled by task + retryable
 	retried      *prometheus.CounterVec
 	deadLettered *prometheus.CounterVec
+	leaseLost    *prometheus.CounterVec
 	duration     *prometheus.HistogramVec
 
 	streamLength    prometheus.Gauge
@@ -35,10 +36,19 @@ type Metrics struct {
 	deadLetterDepth prometheus.Gauge
 	retryScheduled  prometheus.Gauge
 
-	// startTimes tracks per-job start timestamps so JobCompleted/JobFailed can
-	// observe duration. The map is keyed by JobID.
+	// startTimes tracks per-delivery start timestamps so the terminal
+	// callbacks can observe duration. Keyed by startKey.
 	startTimes sync.Map
 }
+
+// startKey identifies one delivery: the same job can be redelivered while an
+// earlier delivery is still running.
+type startKey struct {
+	id        queue.JobID
+	messageID string
+}
+
+func keyOf(job queue.Job) startKey { return startKey{job.ID, job.Lease.MessageID} }
 
 // New constructs a Metrics and registers all collectors with reg. Pass
 // prometheus.DefaultRegisterer (or nil, which is the same) to use the
@@ -74,6 +84,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "dtq_jobs_dead_lettered_total",
 			Help: "Total jobs moved to the dead-letter stream, partitioned by task.",
 		}, []string{taskLabel}),
+		leaseLost: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "dtq_job_leases_lost_total",
+			Help: "Total job results discarded because another worker had taken over the job's lease.",
+		}, []string{taskLabel}),
 		duration: factory.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "dtq_job_duration_seconds",
 			Help:    "Handler runtime in seconds, partitioned by task.",
@@ -106,12 +120,12 @@ func (m *Metrics) JobEnqueued(_ context.Context, job queue.Job) {
 
 func (m *Metrics) JobStarted(_ context.Context, job queue.Job) {
 	// stash time.Now() so JobCompleted/JobFailed can call duration.Observe.
-	m.startTimes.Store(job.ID, time.Now())
+	m.startTimes.Store(keyOf(job), time.Now())
 	m.started.WithLabelValues(job.Task).Inc()
 }
 
 func (m *Metrics) JobCompleted(_ context.Context, job queue.Job) {
-	if start, ok := m.startTimes.LoadAndDelete(job.ID); ok {
+	if start, ok := m.startTimes.LoadAndDelete(keyOf(job)); ok {
 		m.duration.WithLabelValues(job.Task).Observe(time.Since(start.(time.Time)).Seconds())
 	}
 	m.completed.WithLabelValues(job.Task).Inc()
@@ -126,17 +140,22 @@ func (m *Metrics) JobFailed(_ context.Context, job queue.Job, retryable bool) {
 }
 
 func (m *Metrics) JobRetried(_ context.Context, job queue.Job) {
-	if start, ok := m.startTimes.LoadAndDelete(job.ID); ok {
+	if start, ok := m.startTimes.LoadAndDelete(keyOf(job)); ok {
 		m.duration.WithLabelValues(job.Task).Observe(time.Since(start.(time.Time)).Seconds())
 	}
 	m.retried.WithLabelValues(job.Task).Inc()
 }
 
 func (m *Metrics) JobDeadLettered(_ context.Context, job queue.Job) {
-	if start, ok := m.startTimes.LoadAndDelete(job.ID); ok {
+	if start, ok := m.startTimes.LoadAndDelete(keyOf(job)); ok {
 		m.duration.WithLabelValues(job.Task).Observe(time.Since(start.(time.Time)).Seconds())
 	}
 	m.deadLettered.WithLabelValues(job.Task).Inc()
+}
+
+func (m *Metrics) JobLeaseLost(_ context.Context, job queue.Job) {
+	m.startTimes.Delete(keyOf(job))
+	m.leaseLost.WithLabelValues(job.Task).Inc()
 }
 
 func (m *Metrics) StatsObserved(_ context.Context, stats queue.Stats) {
