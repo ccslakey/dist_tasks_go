@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,11 +45,18 @@ type ShardedConfig struct {
 // Claim sweeps the partitions for ready jobs. When all are empty, it
 // long-polls every partition at once (a blocking read can't span cluster
 // slots) and returns as soon as any delivers; jobs the other polls bring back
-// are buffered for the next Claim. Use one Sharded per worker: buffered jobs
-// are leased to the worker that started the poll.
+// are buffered for the next Claim. A poll that comes back empty while a Claim
+// is still waiting is reissued at once, so an idle worker always has a read
+// blocked on every partition. Use one Sharded per worker: buffered jobs are
+// leased to the worker that started the poll.
+//
+// Long polls use a client of their own, which Close closes to cut off reads
+// still blocked in Redis instead of waiting for them to time out.
 type Sharded struct {
-	client redis.UniversalClient
-	parts  []*Store
+	client     redis.UniversalClient
+	pollClient redis.UniversalClient
+	pollConns  *connTracker // pollClient's sockets
+	parts      []*Store
 
 	enqueueNext atomic.Uint64 // round-robin enqueue cursor
 	claimNext   atomic.Uint64 // rotates where claim sweeps start
@@ -56,10 +64,22 @@ type Sharded struct {
 	pollCtx   context.Context
 	stopPolls context.CancelFunc
 	pollers   sync.WaitGroup
-	mu        sync.Mutex
-	polling   []bool      // partitions with a long poll in flight
-	buffered  []queue.Job // claimed by long polls, not yet handed out
-	arrived   chan struct{}
+	closeOnce sync.Once
+	closed    chan struct{}
+	arrived   chan struct{} // signalled when a poll buffers jobs
+
+	mu       sync.Mutex
+	waiting  int    // Claims waiting on long polls
+	polling  []bool // partitions with a poller running
+	pollWith pollArgs
+	buffered []queue.Job // claimed by long polls, not yet handed out
+}
+
+// pollArgs are what the pollers claim with, taken from the latest Claim.
+type pollArgs struct {
+	worker string
+	count  int
+	wait   time.Duration
 }
 
 func NewSharded(config ShardedConfig) (*Sharded, error) {
@@ -72,16 +92,25 @@ func NewSharded(config ShardedConfig) (*Sharded, error) {
 	if config.Prefix == "" {
 		config.Prefix = "dtq"
 	}
-	client := redis.NewUniversalClient(&redis.UniversalOptions{
-		Addrs:         config.Addrs,
-		IsClusterMode: config.Cluster,
-		Protocol:      2,
-	})
-
+	newClient := func(poolSize int, dialer func(context.Context, string, string) (net.Conn, error)) redis.UniversalClient {
+		return redis.NewUniversalClient(&redis.UniversalOptions{
+			Addrs:                 config.Addrs,
+			IsClusterMode:         config.Cluster,
+			Protocol:              2,
+			PoolSize:              poolSize,
+			Dialer:                dialer,
+			ContextTimeoutEnabled: true, // see blockGrace
+		})
+	}
+	pollConns := &connTracker{conns: map[*trackedConn]struct{}{}}
+	client := newClient(0, nil)
 	s := &Sharded{
-		client:  client,
-		polling: make([]bool, config.Partitions),
-		arrived: make(chan struct{}, 1),
+		client:     client,
+		pollClient: newClient(config.Partitions+1, pollConns.dial), // at most one poll per partition
+		pollConns:  pollConns,
+		polling:    make([]bool, config.Partitions),
+		closed:     make(chan struct{}),
+		arrived:    make(chan struct{}, 1),
 	}
 	s.pollCtx, s.stopPolls = context.WithCancel(context.Background())
 	for p := range config.Partitions {
@@ -96,18 +125,80 @@ func NewSharded(config ShardedConfig) (*Sharded, error) {
 			ConsumerIdleTimeout: config.ConsumerIdleTimeout,
 		})
 		if err != nil {
-			client.Close()
+			s.Close()
 			return nil, fmt.Errorf("partition %d: %w", p, err)
 		}
+		part.blockRds = s.pollClient
 		s.parts = append(s.parts, part)
 	}
 	return s, nil
 }
 
+// Close stops the long polls, cutting off any still blocked in Redis, and
+// closes the connections. Jobs the polls had already claimed but no Claim
+// handed out stay pending until the visibility timeout, then are recovered.
 func (s *Sharded) Close() error {
-	s.stopPolls()
-	s.pollers.Wait()
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		close(s.closed) // under mu, so no Claim starts a poller after this
+		s.mu.Unlock()
+		s.stopPolls()
+		s.pollConns.closeAll() // fails reads blocked in Redis right away
+		s.pollers.Wait()
+		s.pollClient.Close()
+	})
 	return s.client.Close()
+}
+
+// connTracker records a client's sockets so they can be closed while reads
+// are blocked on them. The client's own Close can't do that: go-redis
+// health-checks each connection before closing it, and the check waits for
+// any read in progress, so a blocked XREADGROUP holds Close up until the
+// block ends.
+type connTracker struct {
+	mu     sync.Mutex
+	conns  map[*trackedConn]struct{}
+	closed bool
+}
+
+type trackedConn struct {
+	net.Conn
+	tracker *connTracker
+}
+
+func (c *trackedConn) Close() error {
+	c.tracker.mu.Lock()
+	delete(c.tracker.conns, c)
+	c.tracker.mu.Unlock()
+	return c.Conn.Close()
+}
+
+func (t *connTracker) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 5 * time.Minute} // go-redis's defaults
+	conn, err := d.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		conn.Close()
+		return nil, net.ErrClosed
+	}
+	tc := &trackedConn{Conn: conn, tracker: t}
+	t.conns[tc] = struct{}{}
+	return tc, nil
+}
+
+// closeAll closes every socket and refuses new ones.
+func (t *connTracker) closeAll() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+	for c := range t.conns {
+		c.Conn.Close()
+	}
+	clear(t.conns)
 }
 
 // Partitions returns the partition stores, e.g. to inspect them one by one.
@@ -200,53 +291,98 @@ func (s *Sharded) Claim(ctx context.Context, workerID string, limit int, wait ti
 	return s.waitForJobs(ctx, workerID, limit, wait), nil
 }
 
-// waitForJobs long-polls every partition that doesn't already have a poll in
-// flight and returns as soon as any of them delivers, or after wait. Each
-// poll asks for a share of limit, so at most about limit+partitions jobs end
-// up buffered.
+// waitForJobs makes sure every partition has a poller and returns as soon as
+// one of them delivers, or after wait. Each poll asks for a share of limit,
+// and a poller stops once it delivers, so at most about limit+partitions
+// jobs end up buffered.
+//
+// waitForJobs never waits longer than wait itself, whatever the polls do: a
+// poll the server doesn't end on time is left running (claimBlocking gives
+// up on it after blockGrace) rather than holding up the worker.
 func (s *Sharded) waitForJobs(ctx context.Context, workerID string, limit int, wait time.Duration) []queue.Job {
-	share := max(1, (limit+len(s.parts)-1)/len(s.parts))
 	s.mu.Lock()
+	select {
+	case <-s.closed:
+		s.mu.Unlock()
+		return nil
+	default:
+	}
+	s.waiting++
+	s.pollWith = pollArgs{worker: workerID, count: max(1, (limit+len(s.parts)-1)/len(s.parts)), wait: wait}
 	for p := range s.parts {
 		if !s.polling[p] {
 			s.polling[p] = true
-			s.pollers.Go(func() { s.poll(p, workerID, share, wait) })
+			s.pollers.Go(func() { s.poll(p) })
 		}
 	}
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.waiting--
+		s.mu.Unlock()
+	}()
 
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
-	select {
-	case <-s.arrived:
-	case <-timer.C:
-	case <-ctx.Done():
+	for {
+		select {
+		case <-s.arrived:
+			// The signal can be stale (an earlier Claim already took those
+			// jobs), so keep waiting if there's nothing.
+			if jobs := s.takeBuffered(limit); len(jobs) > 0 {
+				return jobs
+			}
+			continue
+		case <-timer.C:
+		case <-ctx.Done():
+		case <-s.closed:
+		}
+		return s.takeBuffered(limit)
 	}
-	return s.takeBuffered(limit)
 }
 
-func (s *Sharded) poll(p int, workerID string, count int, wait time.Duration) {
-	defer func() {
+// poll long-polls partition p for as long as some Claim is waiting, and
+// stops once it delivers jobs (the next Claim's sweep picks up from there).
+func (s *Sharded) poll(p int) {
+	for {
 		s.mu.Lock()
+		if s.waiting == 0 || s.pollCtx.Err() != nil {
+			s.polling[p] = false
+			s.mu.Unlock()
+			return
+		}
+		args := s.pollWith
+		s.mu.Unlock()
+
+		got, err := s.parts[p].claimBlocking(s.pollCtx, args.worker, args.count, args.wait)
+		if err != nil {
+			if s.pollCtx.Err() == nil {
+				slog.Warn("long poll failed", "partition", p, "err", err)
+				sleep(s.pollCtx, max(args.wait, 100*time.Millisecond))
+			}
+			continue
+		}
+		if len(got) == 0 {
+			continue
+		}
+		s.mu.Lock()
+		s.buffered = append(s.buffered, tag(got, p)...)
 		s.polling[p] = false
 		s.mu.Unlock()
-	}()
-	got, err := s.parts[p].claimBlocking(s.pollCtx, workerID, count, wait)
-	if err != nil {
-		if s.pollCtx.Err() == nil {
-			slog.Warn("long poll failed", "partition", p, "err", err)
+		select {
+		case s.arrived <- struct{}{}:
+		default:
 		}
 		return
 	}
-	if len(got) == 0 {
-		return
-	}
-	s.mu.Lock()
-	s.buffered = append(s.buffered, tag(got, p)...)
-	s.mu.Unlock()
+}
+
+func sleep(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
 	select {
-	case s.arrived <- struct{}{}:
-	default:
+	case <-ctx.Done():
+	case <-t.C:
 	}
 }
 

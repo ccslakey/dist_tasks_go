@@ -4,11 +4,14 @@ import (
 	"context"
 	"dist_tasks_go/queue"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -33,6 +36,9 @@ type Store struct {
 	config     Config
 	rds        redis.UniversalClient
 	ownsClient bool // Close closes rds only if New created it
+	// blockRds runs blocking reads. It's rds unless Sharded gives its long
+	// polls a client of their own, which it can close to cut them off.
+	blockRds redis.UniversalClient
 	// retryData holds the fields of each scheduled job, keyed by job ID.
 	retryData string
 
@@ -52,6 +58,9 @@ func New(config Config) (*Store, error) {
 		Password: "", // no password
 		DB:       0,  // use default DB
 		Protocol: 2,
+		// Lets claimBlocking's deadline cut off a blocking read that the
+		// server fails to end on time.
+		ContextTimeoutEnabled: true,
 	})
 	store, err := NewWithClient(client, config)
 	if err != nil {
@@ -97,6 +106,7 @@ func NewWithClient(client redis.UniversalClient, config Config) (*Store, error) 
 	return &Store{
 		config:        config,
 		rds:           client,
+		blockRds:      client,
 		retryData:     config.RetryKey + ":jobs",
 		recoverCursor: "0-0",
 	}, nil
@@ -263,10 +273,26 @@ func (b *Store) claimReady(ctx context.Context, workerID string, limit int) ([]q
 	return jobs, nil
 }
 
+// blockGrace is how long past its BLOCK time a blocking read may run before
+// the client gives up on it. Redis normally ends a block on time, so this only
+// matters when it doesn't: a stalled network, or a server whose timers have
+// stopped firing (seen on a long-running macOS Redis, which released blocked
+// clients only when unrelated traffic happened to wake its event loop). The
+// deadline is enforced only by clients with ContextTimeoutEnabled; others
+// fall back to go-redis's own limit of BLOCK + 10s.
+const blockGrace = 500 * time.Millisecond
+
 // claimBlocking waits up to wait for new entries and claims them. It doesn't
 // promote retries: XREADGROUP can't block inside a script.
+//
+// A read that outlives wait+blockGrace is abandoned and treated as finding
+// nothing, so a stuck server can't hold up the caller. If Redis delivered
+// entries just as the client gave up, they stay pending under workerID and
+// are recovered after the visibility timeout, like any lost delivery.
 func (b *Store) claimBlocking(ctx context.Context, workerID string, limit int, wait time.Duration) ([]queue.Job, error) {
-	streams, err := b.rds.XReadGroup(ctx, &redis.XReadGroupArgs{
+	readCtx, cancel := context.WithTimeout(ctx, wait+blockGrace)
+	defer cancel()
+	streams, err := b.blockRds.XReadGroup(readCtx, &redis.XReadGroupArgs{
 		Group:    b.config.Group,
 		Consumer: workerID,
 		Count:    int64(limit),
@@ -277,6 +303,10 @@ func (b *Store) claimBlocking(ctx context.Context, workerID string, limit int, w
 		return nil, nil
 	}
 	if err != nil {
+		if ctx.Err() == nil && isTimeout(err) {
+			b.warnStuckBlock(wait)
+			return nil, nil
+		}
 		return nil, fmt.Errorf("xreadgroup for %s: %w", workerID, err)
 	}
 
@@ -291,6 +321,26 @@ func (b *Store) claimBlocking(ctx context.Context, workerID string, limit int, w
 		}
 	}
 	return jobs, nil
+}
+
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
+}
+
+// lastStuckWarn is when warnStuckBlock last logged (unix ns).
+var lastStuckWarn atomic.Int64
+
+// warnStuckBlock logs, at most once a minute per process, that Redis didn't
+// end a blocking read on time.
+func (b *Store) warnStuckBlock(wait time.Duration) {
+	now := time.Now().UnixNano()
+	last := lastStuckWarn.Load()
+	if now-last < int64(time.Minute) || !lastStuckWarn.CompareAndSwap(last, now) {
+		return
+	}
+	slog.Warn("Redis didn't end a blocking read on time; treating it as empty. If this keeps happening, the server's timers may be stuck: restart it",
+		"stream", b.config.Stream, "block", wait, "gave_up_after", wait+blockGrace)
 }
 
 // flatToMap converts a script's [field, value, ...] reply into a map.

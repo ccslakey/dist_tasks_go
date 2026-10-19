@@ -119,21 +119,73 @@ func TestShardedBlockingClaimWakesOnAnyPartition(t *testing.T) {
 	ctx := t.Context()
 
 	for i := range 4 { // round-robin puts each one on a different partition
-		go func() {
-			time.Sleep(50 * time.Millisecond)
-			s.Enqueue(ctx, newJob(3))
-		}()
-		start := time.Now()
-		jobs, err := s.Claim(ctx, "worker-1", 10, 2*time.Second)
-		if err != nil || len(jobs) != 1 {
-			t.Fatalf("claim %d: jobs=%d err=%v, want 1", i, len(jobs), err)
+		jobs, pickup := claimWhileEnqueueing(t, s, 50*time.Millisecond, 2*time.Second)
+		if len(jobs) != 1 {
+			t.Fatalf("claim %d: got %d jobs, want 1", i, len(jobs))
 		}
-		if waited := time.Since(start); waited > time.Second {
-			t.Errorf("claim %d took %s; it should wake when a job lands on any partition", i, waited)
+		if pickup > 100*time.Millisecond {
+			t.Errorf("claim %d picked its job up %s after it was enqueued; it should wake when a job lands on any partition", i, pickup)
 		}
 		if err := s.Ack(ctx, jobs[0]); err != nil {
 			t.Fatalf("Ack: %v", err)
 		}
+	}
+}
+
+// claimWhileEnqueueing starts a Claim that waits up to wait, enqueues a job
+// after delay, and returns what the Claim got and how long after the enqueue
+// it returned.
+func claimWhileEnqueueing(t *testing.T, s *Sharded, delay, wait time.Duration) ([]queue.Job, time.Duration) {
+	t.Helper()
+	enqueued := make(chan time.Time, 1)
+	go func() {
+		time.Sleep(delay)
+		if _, err := s.Enqueue(t.Context(), newJob(3)); err != nil {
+			t.Errorf("Enqueue: %v", err)
+		}
+		enqueued <- time.Now()
+	}()
+	jobs, err := s.Claim(t.Context(), "worker-1", 10, wait)
+	returned := time.Now()
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	return jobs, returned.Sub(<-enqueued)
+}
+
+// An idle worker calls Claim again as soon as one times out. Polls from the
+// old Claim may still be finishing then; they must be reissued for the new
+// one, or a job landing on their partitions waits out the whole Claim.
+func TestShardedPickupRightAfterAnIdleClaimTimesOut(t *testing.T) {
+	s := newTestSharded(t, 4)
+	ctx := t.Context()
+
+	for i := range 8 {
+		if jobs, err := s.Claim(ctx, "worker-1", 10, 20*time.Millisecond); err != nil || len(jobs) != 0 {
+			t.Fatalf("idle claim: jobs=%d err=%v", len(jobs), err)
+		}
+		jobs, pickup := claimWhileEnqueueing(t, s, 5*time.Millisecond, 2*time.Second)
+		if len(jobs) != 1 {
+			t.Fatalf("claim %d: got %d jobs, want 1", i, len(jobs))
+		}
+		if pickup > 100*time.Millisecond {
+			t.Errorf("claim %d picked its job up %s after it was enqueued", i, pickup)
+		}
+		if err := s.Ack(ctx, jobs[0]); err != nil {
+			t.Fatalf("Ack: %v", err)
+		}
+	}
+}
+
+func TestShardedCloseDoesNotWaitOutLongPolls(t *testing.T) {
+	s := newTestSharded(t, 4)
+	go s.Claim(t.Context(), "worker-1", 10, 10*time.Second)
+	time.Sleep(100 * time.Millisecond) // let the polls block
+
+	start := time.Now()
+	s.Close()
+	if took := time.Since(start); took > 200*time.Millisecond {
+		t.Errorf("Close took %s; it should cut off blocked polls", took)
 	}
 }
 
