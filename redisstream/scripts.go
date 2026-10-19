@@ -158,3 +158,21 @@ else
 end
 return ARGV[1]
 `)
+
+// Acks a batch of deliveries in one round trip, each fenced like ackScript.
+// KEYS[1]=stream ARGV[1]=group, then ARGV[2..] = message ID, owner, token
+// triples. Returns one 1 (acked) or 0 (lease lost) per delivery.
+var ackBatchScript = redis.NewScript(`
+local out = {}
+for i = 2, #ARGV, 3 do
+  local p = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[i], ARGV[i], 1)
+  if #p > 0 and p[1][2] == ARGV[i + 1] and p[1][4] == tonumber(ARGV[i + 2]) then
+    redis.call('XACK', KEYS[1], ARGV[1], ARGV[i])
+    redis.call('XDEL', KEYS[1], ARGV[i])
+    out[#out + 1] = 1
+  else
+    out[#out + 1] = 0
+  end
+end
+return out
+`)

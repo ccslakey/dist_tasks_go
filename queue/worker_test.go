@@ -107,6 +107,33 @@ func TestWorkerBoundsConcurrency(t *testing.T) {
 	}
 }
 
+func TestWorkerBatchesAcks(t *testing.T) {
+	const jobs = 50
+	backend := &batchingBackend{fakeBackend: &fakeBackend{}}
+	for i := range jobs {
+		backend.ready = append(backend.ready, testJob(JobID(fmt.Sprint(i)), "email"))
+	}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", Concurrency: 8, PollInterval: time.Millisecond}, nil)
+	worker.Register("email", func(context.Context, Job) JobResult { return JobResult{} })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	waitFor(t, func() bool { return backend.ackedCount() == jobs })
+	cancel()
+	<-done
+}
+
+// batchingBackend adds AckBatch to fakeBackend.
+type batchingBackend struct{ *fakeBackend }
+
+func (b *batchingBackend) AckBatch(ctx context.Context, jobs []Job) []error {
+	errs := make([]error, len(jobs))
+	for i, job := range jobs {
+		errs[i] = b.Ack(ctx, job)
+	}
+	return errs
+}
+
 func TestWorkerShutdownDrainsAndAcksInFlightJobs(t *testing.T) {
 	backend := &fakeBackend{ready: []Job{testJob("job-1", "slow")}}
 	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", PollInterval: time.Millisecond}, nil)
@@ -225,19 +252,23 @@ func (f *fakeBackend) Enqueue(_ context.Context, job Job) (JobID, error) {
 	return job.ID, nil
 }
 
-func (f *fakeBackend) Claim(ctx context.Context, _ string, limit int) ([]Job, error) {
+func (f *fakeBackend) Claim(ctx context.Context, _ string, limit int, wait time.Duration) ([]Job, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.claimErrs > 0 {
 		f.claimErrs--
+		f.mu.Unlock()
 		return nil, errors.New("connection refused")
 	}
 	n := min(limit, len(f.ready))
 	jobs := f.ready[:n:n]
 	f.ready = f.ready[n:]
+	f.mu.Unlock()
+	if n == 0 {
+		sleep(ctx, wait) // like a blocking XREADGROUP on an empty stream
+	}
 	return jobs, nil
 }
 

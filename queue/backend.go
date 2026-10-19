@@ -9,8 +9,9 @@ type Backend interface {
 	// Enqueue stores a new job and returns its stable ID. Jobs whose
 	// AvailableAt is in the future are scheduled rather than made runnable.
 	Enqueue(ctx context.Context, job Job) (JobID, error)
-	// Claim leases up to limit never-delivered jobs to workerID.
-	Claim(ctx context.Context, workerID string, limit int) ([]Job, error)
+	// Claim leases up to limit never-delivered jobs to workerID. If none are
+	// ready it waits up to wait for one to arrive (0 means don't wait).
+	Claim(ctx context.Context, workerID string, limit int, wait time.Duration) ([]Job, error)
 	// RecoverExpired leases up to limit jobs whose previous lease has been
 	// idle longer than visibilityTimeout (e.g. their worker crashed).
 	RecoverExpired(ctx context.Context, visibilityTimeout time.Duration, workerID string, limit int) ([]Job, error)

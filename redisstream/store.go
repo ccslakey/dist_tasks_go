@@ -159,7 +159,11 @@ func (b *Store) schedule(ctx context.Context, job queue.Job, runAt time.Time) er
 	return err
 }
 
-func (b *Store) Claim(ctx context.Context, workerID string, limit int) ([]queue.Job, error) {
+func (b *Store) Claim(ctx context.Context, workerID string, limit int, wait time.Duration) ([]queue.Job, error) {
+	block := time.Duration(-1) // non-blocking; go-redis treats 0 as BLOCK 0 (block forever)
+	if wait > 0 {
+		block = wait
+	}
 	// Promote any due retries first so they're visible to this XREADGROUP call.
 	if _, err := b.promoteRetries(ctx, 100); err != nil {
 		return nil, fmt.Errorf("promote retries: %w", err)
@@ -170,7 +174,7 @@ func (b *Store) Claim(ctx context.Context, workerID string, limit int) ([]queue.
 		Consumer: workerID,
 		Count:    int64(limit),
 		Streams:  []string{b.config.Stream, ">"},
-		Block:    -1, // non-blocking; go-redis treats 0 as BLOCK 0 (block forever)
+		Block:    block,
 	}).Result()
 	if err == redis.Nil {
 		return nil, nil
@@ -283,6 +287,26 @@ func (b *Store) fenced(ctx context.Context, script *redis.Script, keys []string,
 
 func (b *Store) Ack(ctx context.Context, job queue.Job) error {
 	return b.fenced(ctx, ackScript, []string{b.config.Stream}, job)
+}
+
+// AckBatch acks several jobs in one round trip. The result has one entry
+// per job: nil, ErrLeaseLost, or the error that failed the whole batch.
+func (b *Store) AckBatch(ctx context.Context, jobs []queue.Job) []error {
+	args := []any{b.config.Group}
+	for _, job := range jobs {
+		args = append(args, job.Lease.MessageID, job.Lease.Owner, job.Lease.Token)
+	}
+	errs := make([]error, len(jobs))
+	res, err := ackBatchScript.Run(ctx, b.rds, []string{b.config.Stream}, args...).Int64Slice()
+	for i := range jobs {
+		switch {
+		case err != nil:
+			errs[i] = err
+		case i >= len(res) || res[i] == 0:
+			errs[i] = queue.ErrLeaseLost
+		}
+	}
+	return errs
 }
 
 func (b *Store) Extend(ctx context.Context, job queue.Job) error {

@@ -15,9 +15,14 @@ type HandlerFunc func(ctx context.Context, job Job) JobResult
 type WorkerConfig struct {
 	ID          string
 	Concurrency int
-	// PollInterval is how long the worker waits before polling again when
-	// the queue is empty.
+	// PollInterval is how long a claim blocks waiting for new jobs when the
+	// queue is empty (or, with PollOnly, how long the worker sleeps between
+	// polls). It also paces lease recovery.
 	PollInterval time.Duration
+	// PollOnly makes the worker poll with non-blocking claims and sleep
+	// PollInterval between empty polls, instead of blocking in the claim.
+	// Blocking is faster to pick up new jobs; this exists for comparison.
+	PollOnly bool
 	// VisibilityTimeout is how long a lease can go without a heartbeat
 	// before other workers may recover the job.
 	VisibilityTimeout time.Duration
@@ -43,6 +48,7 @@ type Worker struct {
 	metrics  Metrics
 	config   WorkerConfig
 	handlers map[string]HandlerFunc
+	acks     chan ackRequest // set during Run if the backend can batch acks
 }
 
 // errShutdown is the cancellation cause for jobs still running when the
@@ -124,6 +130,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	stopHeartbeat := make(chan struct{})
 	var background sync.WaitGroup
 	background.Go(func() { w.heartbeat(jobsCtx, &running, stopHeartbeat) })
+	if b, ok := w.backend.(batchAcker); ok {
+		w.acks = make(chan ackRequest, w.config.Concurrency)
+		background.Go(func() { w.ackLoop(jobsCtx, b, stopHeartbeat) })
+	}
 	background.Go(func() { w.reportStats(ctx) })
 
 	var (
@@ -165,8 +175,10 @@ func (w *Worker) Run(ctx context.Context) error {
 				continue
 			}
 			backoff = 0
-			if len(claimed) == free {
-				continue // the queue may have more ready right now
+			if len(claimed) == free || !w.config.PollOnly {
+				// Either more may be ready right now, or the claim already
+				// blocked waiting for jobs and should be retried at once.
+				continue
 			}
 		}
 
@@ -210,6 +222,10 @@ type deregisterer interface {
 // new jobs. Recovery runs at most every PollInterval unless it keeps finding
 // work, so the PEL scan stays off the hot path.
 func (w *Worker) fetch(ctx context.Context, limit int, lastRecover *time.Time) ([]Job, error) {
+	wait := w.config.PollInterval
+	if w.config.PollOnly {
+		wait = 0
+	}
 	var jobs []Job
 	if time.Since(*lastRecover) >= w.config.PollInterval {
 		recovered, err := w.backend.RecoverExpired(ctx, w.config.VisibilityTimeout, w.config.ID, limit)
@@ -225,7 +241,11 @@ func (w *Worker) fetch(ctx context.Context, limit int, lastRecover *time.Time) (
 		jobs = recovered
 	}
 	if len(jobs) < limit {
-		claimed, err := w.backend.Claim(ctx, w.config.ID, limit-len(jobs))
+		// Don't block if recovery already found work to start.
+		if len(jobs) > 0 {
+			wait = 0
+		}
+		claimed, err := w.backend.Claim(ctx, w.config.ID, limit-len(jobs), wait)
 		jobs = append(jobs, claimed...)
 		if err != nil {
 			return jobs, fmt.Errorf("claim: %w", err)
@@ -270,7 +290,7 @@ func (w *Worker) handleOne(ctx context.Context, job Job) error {
 	}
 
 	if jobRes.Err == nil {
-		if err := w.backend.Ack(ctx, job); err != nil {
+		if err := w.ack(ctx, job); err != nil {
 			return err
 		}
 		w.metrics.JobCompleted(ctx, job)
@@ -296,6 +316,60 @@ func (w *Worker) deadLetter(ctx context.Context, job Job, reason string) error {
 	w.metrics.JobDeadLettered(ctx, job)
 	slog.Warn("job dead-lettered", "worker", w.config.ID, "job_id", job.ID, "task", job.Task, "reason", reason)
 	return nil
+}
+
+// batchAcker is implemented by backends that can ack many jobs in one
+// round trip. It returns one error per job.
+type batchAcker interface {
+	AckBatch(ctx context.Context, jobs []Job) []error
+}
+
+type ackRequest struct {
+	job  Job
+	done chan error
+}
+
+// maxAckBatch caps how many acks go out in one round trip.
+const maxAckBatch = 256
+
+func (w *Worker) ack(ctx context.Context, job Job) error {
+	if w.acks == nil {
+		return w.backend.Ack(ctx, job)
+	}
+	req := ackRequest{job: job, done: make(chan error, 1)}
+	w.acks <- req
+	return <-req.done
+}
+
+// ackLoop group-commits acks: while one batch is in flight, new acks queue
+// up and go out together in the next one. Under light load every batch has
+// one ack, so this adds no latency; under heavy load it cuts round trips.
+func (w *Worker) ackLoop(ctx context.Context, b batchAcker, stop <-chan struct{}) {
+	for {
+		var batch []ackRequest
+		select {
+		case <-stop:
+			return
+		case req := <-w.acks:
+			batch = append(batch, req)
+		}
+	more:
+		for len(batch) < maxAckBatch {
+			select {
+			case req := <-w.acks:
+				batch = append(batch, req)
+			default:
+				break more
+			}
+		}
+		jobs := make([]Job, len(batch))
+		for i, req := range batch {
+			jobs[i] = req.job
+		}
+		for i, err := range b.AckBatch(ctx, jobs) {
+			batch[i].done <- err
+		}
+	}
 }
 
 // heartbeat renews the lease of every running job. A job whose lease was

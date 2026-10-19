@@ -52,7 +52,7 @@ func claimOne(t *testing.T, store *Store, workerID string) queue.Job {
 	if _, err := store.Enqueue(t.Context(), newJob(3)); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	jobs, err := store.Claim(t.Context(), workerID, 10)
+	jobs, err := store.Claim(t.Context(), workerID, 10, 0)
 	if err != nil || len(jobs) != 1 {
 		t.Fatalf("Claim: jobs=%d err=%v", len(jobs), err)
 	}
@@ -71,7 +71,7 @@ func TestEnqueueClaimAck(t *testing.T) {
 		t.Fatal("Enqueue returned empty JobID")
 	}
 
-	jobs, err := store.Claim(ctx, "worker-1", 10)
+	jobs, err := store.Claim(ctx, "worker-1", 10, 0)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestRetryPromotionKeepsJobID(t *testing.T) {
 	}
 
 	// Next Claim promotes due retries first, so it picks up the job in the same call.
-	jobs, err := store.Claim(ctx, "worker-1", 10)
+	jobs, err := store.Claim(ctx, "worker-1", 10, 0)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -268,11 +268,11 @@ func TestDelayedEnqueue(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	if jobs, err := store.Claim(ctx, "worker-1", 10); err != nil || len(jobs) != 0 {
+	if jobs, err := store.Claim(ctx, "worker-1", 10, 0); err != nil || len(jobs) != 0 {
 		t.Fatalf("Claim before delay: jobs=%d err=%v, want none", len(jobs), err)
 	}
 	time.Sleep(200 * time.Millisecond)
-	jobs, err := store.Claim(ctx, "worker-1", 10)
+	jobs, err := store.Claim(ctx, "worker-1", 10, 0)
 	if err != nil || len(jobs) != 1 || jobs[0].ID != id {
 		t.Fatalf("Claim after delay: jobs=%v err=%v, want job %s", jobs, err, id)
 	}
@@ -304,7 +304,7 @@ func TestConsumerCleanupKeepsConsumersWithPendingJobs(t *testing.T) {
 	ctx := t.Context()
 
 	held := claimOne(t, store, "busy")
-	if _, err := store.Claim(ctx, "idle", 10); err != nil {
+	if _, err := store.Claim(ctx, "idle", 10, 0); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
 	if err := store.Deregister(ctx, "busy"); err != nil {
@@ -372,5 +372,40 @@ func TestIdempotentEnqueue(t *testing.T) {
 	}
 	if stats.StreamLength != 1 || stats.RetryScheduled != 1 {
 		t.Errorf("stream=%d scheduled=%d, want one job each", stats.StreamLength, stats.RetryScheduled)
+	}
+}
+
+func TestBlockingClaimReturnsAsSoonAsAJobArrives(t *testing.T) {
+	store := newTestStore(t)
+	ctx := t.Context()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		store.Enqueue(ctx, newJob(3))
+	}()
+	start := time.Now()
+	jobs, err := store.Claim(ctx, "worker-1", 10, 2*time.Second)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("Claim: jobs=%d err=%v, want 1", len(jobs), err)
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Errorf("blocking claim took %s; it should return when the job arrives", waited)
+	}
+}
+
+func TestAckBatchFencesEachJob(t *testing.T) {
+	store := newTestStore(t)
+	ctx := t.Context()
+
+	current := claimOne(t, store, "worker-1")
+	stale := claimOne(t, store, "worker-1")
+	stale.Lease.Token = 99
+
+	errs := store.AckBatch(ctx, []queue.Job{current, stale})
+	if errs[0] != nil || !errors.Is(errs[1], queue.ErrLeaseLost) {
+		t.Fatalf("AckBatch errors = %v, want [nil ErrLeaseLost]", errs)
+	}
+	if stats, _ := store.Stats(ctx); stats.InFlight != 1 {
+		t.Errorf("InFlight = %d, want 1 (only the stale job left)", stats.InFlight)
 	}
 }
