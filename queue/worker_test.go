@@ -3,6 +3,9 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -18,25 +21,447 @@ func TestWorkerRegisterRejectsInvalidHandlers(t *testing.T) {
 	}
 }
 
-func TestWorkerHandleOneUnknownTask(t *testing.T) {
-	worker := NewWorker(fakeBackend{}, WorkerConfig{ID: "worker-1"}, nil)
-	err := worker.handleOne(context.Background(), Job{ID: "job-1", Task: "missing", MaxAttempts: 3})
-	if !errors.Is(err, ErrUnknownTask) {
-		t.Fatalf("got %v, want ErrUnknownTask", err)
+// A worker without a handler leaves the job for another worker (one that may
+// have it, mid rolling deploy) and only dead-letters it at MaxDeliveries, so
+// it can't sit pending forever either.
+func TestWorkerLeavesUnknownTaskForAnotherWorker(t *testing.T) {
+	backend := &fakeBackend{}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", MaxDeliveries: 3}, nil)
+
+	job := testJob("job-1", "missing")
+	for token := int64(1); token < 3; token++ {
+		job.Lease.Token = token
+		if err := worker.handleOne(t.Context(), job); !errors.Is(err, ErrUnknownTask) {
+			t.Fatalf("delivery %d: got %v, want ErrUnknownTask", token, err)
+		}
+		if len(backend.deadLettered()) != 0 || backend.ackedCount() != 0 {
+			t.Fatalf("delivery %d settled the job; it should be left for another worker", token)
+		}
+	}
+
+	job.Lease.Token = 3
+	if err := worker.handleOne(t.Context(), job); err != nil {
+		t.Fatalf("delivery 3: %v", err)
+	}
+	if _, ok := backend.deadLettered()["job-1"]; !ok {
+		t.Fatal("unknown task not dead-lettered at MaxDeliveries")
 	}
 }
 
-func TestWorkerRunTODO(t *testing.T) {
-	t.Skip("TODO: implement once Worker.Run contains the real claim/concurrency/shutdown loop")
+func TestWorkerMaxAttemptsIsTotalRuns(t *testing.T) {
+	backend := &fakeBackend{}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1"}, nil)
+	worker.Register("flaky", func(context.Context, Job) JobResult {
+		return NewRetryableError(errors.New("boom"))
+	})
+
+	job := testJob("job-1", "flaky")
+	job.MaxAttempts = 3
+	for attempt := 0; attempt < 3; attempt++ {
+		job.Attempt = attempt
+		if err := worker.handleOne(t.Context(), job); err != nil {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
+	}
+	if got := len(backend.retried); got != 2 {
+		t.Errorf("retries = %d, want 2", got)
+	}
+	if _, ok := backend.deadLettered()["job-1"]; !ok {
+		t.Error("job not dead-lettered after its third run")
+	}
 }
 
-type fakeBackend struct{}
+func TestWorkerDeadLettersPoisonMessage(t *testing.T) {
+	backend := &fakeBackend{}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", MaxDeliveries: 3}, nil)
+	ran := false
+	worker.Register("email", func(context.Context, Job) JobResult { ran = true; return JobResult{} })
 
-func (fakeBackend) Enqueue(context.Context, Job) (JobID, error)                        { return "job-1", nil }
-func (fakeBackend) Claim(context.Context, string, int) ([]Job, error)                  { return nil, nil }
-func (fakeBackend) Ack(context.Context, JobID) error                                   { return nil }
-func (fakeBackend) Retry(context.Context, Job, time.Time) error                        { return nil }
-func (fakeBackend) DeadLetter(context.Context, Job, string) error                      { return nil }
-func (fakeBackend) RecoverExpired(context.Context, time.Duration, string) (int, error) { return 0, nil }
-func (fakeBackend) Stats(context.Context) (Stats, error)                               { return Stats{}, nil }
-func (fakeBackend) promoteRetries(ctx context.Context, limit int) (int, error)         { return 0, nil }
+	job := testJob("job-1", "email")
+	job.Lease.Token = 4
+	if err := worker.handleOne(t.Context(), job); err != nil {
+		t.Fatalf("handleOne: %v", err)
+	}
+	if ran {
+		t.Error("handler ran for a job past MaxDeliveries")
+	}
+	if _, ok := backend.deadLettered()["job-1"]; !ok {
+		t.Error("poison message was not dead-lettered")
+	}
+}
+
+func TestWorkerBoundsConcurrency(t *testing.T) {
+	const jobs, concurrency = 30, 3
+	backend := &fakeBackend{}
+	for i := range jobs {
+		backend.ready = append(backend.ready, testJob(JobID(fmt.Sprint(i)), "slow"))
+	}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", Concurrency: concurrency, PollInterval: time.Millisecond}, nil)
+
+	var running, peak atomic.Int64
+	worker.Register("slow", func(context.Context, Job) JobResult {
+		n := running.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		running.Add(-1)
+		return JobResult{}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	waitFor(t, func() bool { return backend.ackedCount() == jobs })
+	cancel()
+	<-done
+
+	if p := peak.Load(); p > concurrency {
+		t.Errorf("peak concurrent handlers = %d, want <= %d", p, concurrency)
+	}
+}
+
+func TestWorkerRenewsLeasesInBatches(t *testing.T) {
+	backend := &batchingBackend{fakeBackend: &fakeBackend{extendErr: ErrLeaseLost}}
+	for i := range 20 {
+		backend.ready = append(backend.ready, testJob(JobID(fmt.Sprint(i)), "slow"))
+	}
+	worker := NewWorker(backend, WorkerConfig{
+		ID:                "worker-1",
+		Concurrency:       20,
+		PollInterval:      time.Millisecond,
+		HeartbeatInterval: 20 * time.Millisecond,
+	}, nil)
+	var cancelled atomic.Int64
+	worker.Register("slow", func(ctx context.Context, _ Job) JobResult {
+		<-ctx.Done()
+		cancelled.Add(1)
+		return JobResult{}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	waitFor(t, func() bool { return cancelled.Load() == 20 })
+	cancel()
+	<-done
+
+	if backend.extendBatches > 2 {
+		t.Errorf("renewing 20 leases took %d calls, want them batched", backend.extendBatches)
+	}
+}
+
+func TestWorkerBatchesAcks(t *testing.T) {
+	const jobs = 50
+	backend := &batchingBackend{fakeBackend: &fakeBackend{}}
+	for i := range jobs {
+		backend.ready = append(backend.ready, testJob(JobID(fmt.Sprint(i)), "email"))
+	}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", Concurrency: 8, PollInterval: time.Millisecond}, nil)
+	worker.Register("email", func(context.Context, Job) JobResult { return JobResult{} })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	waitFor(t, func() bool { return backend.ackedCount() == jobs })
+	cancel()
+	<-done
+}
+
+// batchingBackend adds AckBatch and ExtendBatch to fakeBackend.
+type batchingBackend struct {
+	*fakeBackend
+	extendBatches int
+}
+
+func (b *batchingBackend) ExtendBatch(ctx context.Context, jobs []Job) []error {
+	b.mu.Lock()
+	b.extendBatches++
+	b.mu.Unlock()
+	errs := make([]error, len(jobs))
+	for i, job := range jobs {
+		errs[i] = b.Extend(ctx, job)
+	}
+	return errs
+}
+
+func (b *batchingBackend) AckBatch(ctx context.Context, jobs []Job) []error {
+	errs := make([]error, len(jobs))
+	for i, job := range jobs {
+		errs[i] = b.Ack(ctx, job)
+	}
+	return errs
+}
+
+func TestWorkerShutdownDrainsAndAcksInFlightJobs(t *testing.T) {
+	backend := &fakeBackend{ready: []Job{testJob("job-1", "slow")}}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", PollInterval: time.Millisecond}, nil)
+
+	started, release := make(chan struct{}), make(chan struct{})
+	worker.Register("slow", func(context.Context, Job) JobResult {
+		close(started)
+		<-release
+		return JobResult{}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	<-started
+	cancel() // SIGTERM while the job is running
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	<-done
+
+	if backend.ackedCount() != 1 {
+		t.Fatal("job that finished during shutdown was not acked")
+	}
+}
+
+// A sharded backend can lease jobs from some partitions and then fail on
+// another. The leased jobs must still run instead of waiting out another
+// visibility timeout.
+func TestWorkerRunsJobsRecoveredAlongsideAnError(t *testing.T) {
+	backend := &fakeBackend{
+		recoverable: []Job{testJob("job-1", "email"), testJob("job-2", "email")},
+		recoverErr:  errors.New("partition 3: connection refused"),
+	}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", Concurrency: 4, PollInterval: time.Millisecond}, nil)
+	worker.Register("email", func(context.Context, Job) JobResult { return JobResult{} })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	waitFor(t, func() bool { return backend.ackedCount() == 2 })
+	cancel()
+	<-done
+}
+
+func TestWorkerSurvivesTransientClaimErrors(t *testing.T) {
+	backend := &fakeBackend{ready: []Job{testJob("job-1", "email")}, claimErrs: 2}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", PollInterval: time.Millisecond}, nil)
+	worker.Register("email", func(context.Context, Job) JobResult { return JobResult{} })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	waitFor(t, func() bool { return backend.ackedCount() == 1 })
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled", err)
+	}
+}
+
+func TestWorkerCancelsHandlerWhenLeaseIsLost(t *testing.T) {
+	backend := &fakeBackend{ready: []Job{testJob("job-1", "slow")}, extendErr: ErrLeaseLost}
+	worker := NewWorker(backend, WorkerConfig{
+		ID:                "worker-1",
+		PollInterval:      time.Millisecond,
+		HeartbeatInterval: 5 * time.Millisecond,
+	}, nil)
+
+	cause := make(chan error, 1)
+	worker.Register("slow", func(ctx context.Context, _ Job) JobResult {
+		<-ctx.Done()
+		cause <- context.Cause(ctx)
+		return NewRetryableError(ctx.Err())
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	select {
+	case err := <-cause:
+		if !errors.Is(err, ErrLeaseLost) {
+			t.Errorf("handler cancelled with %v, want ErrLeaseLost", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler was not cancelled after its lease was lost")
+	}
+	cancel()
+	<-done
+
+	if backend.ackedCount() != 0 || len(backend.retried) != 0 {
+		t.Error("worker settled a job whose lease it had lost")
+	}
+}
+
+func testJob(id JobID, task string) Job {
+	return Job{
+		ID:          id,
+		Task:        task,
+		Payload:     []byte(`{}`),
+		MaxAttempts: 3,
+		Lease:       Lease{MessageID: string(id), Owner: "worker-1", Token: 1},
+	}
+}
+
+func runWorker(ctx context.Context, w *Worker) <-chan error {
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+	return done
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for condition")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// fakeBackend is an in-memory Backend. Like go-redis, it rejects calls made
+// with a cancelled context.
+type fakeBackend struct {
+	mu        sync.Mutex
+	ready     []Job
+	claimErrs int   // fail this many Claim calls before succeeding
+	extendErr error // returned by every Extend
+
+	recoverable []Job // returned once by RecoverExpired, along with recoverErr
+	recoverErr  error
+
+	acked   []Job
+	retried []Job
+	dead    map[JobID]string
+}
+
+func (f *fakeBackend) Enqueue(_ context.Context, job Job) (JobID, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ready = append(f.ready, job)
+	return job.ID, nil
+}
+
+func (f *fakeBackend) Claim(ctx context.Context, _ string, limit int, wait time.Duration) ([]Job, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	if f.claimErrs > 0 {
+		f.claimErrs--
+		f.mu.Unlock()
+		return nil, errors.New("connection refused")
+	}
+	n := min(limit, len(f.ready))
+	jobs := f.ready[:n:n]
+	f.ready = f.ready[n:]
+	f.mu.Unlock()
+	if n == 0 {
+		sleep(ctx, wait) // like a blocking XREADGROUP on an empty stream
+	}
+	return jobs, nil
+}
+
+func (f *fakeBackend) RecoverExpired(ctx context.Context, _ time.Duration, _ string, _ int) ([]Job, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	jobs := f.recoverable
+	f.recoverable = nil
+	return jobs, f.recoverErr
+}
+
+func (f *fakeBackend) Extend(ctx context.Context, _ Job) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.extendErr
+}
+
+func (f *fakeBackend) Ack(ctx context.Context, job Job) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.acked = append(f.acked, job)
+	return nil
+}
+
+func (f *fakeBackend) Retry(ctx context.Context, job Job, _ time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.retried = append(f.retried, job)
+	return nil
+}
+
+func (f *fakeBackend) DeadLetter(ctx context.Context, job Job, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.dead == nil {
+		f.dead = map[JobID]string{}
+	}
+	f.dead[job.ID] = reason
+	return nil
+}
+
+func (f *fakeBackend) Stats(context.Context) (Stats, error) { return Stats{}, nil }
+
+func (f *fakeBackend) ackedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.acked)
+}
+
+func (f *fakeBackend) deadLettered() map[JobID]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dead
+}
+
+// When part of a batch fails, the caller must learn which jobs were stored
+// so a retry doesn't duplicate them.
+func TestEnqueueBatchReportsWhichJobsWereStored(t *testing.T) {
+	backend := &failingEnqueuer{fakeBackend: &fakeBackend{}, failAt: 3}
+	reqs := make([]EnqueueRequest, 5)
+	for i := range reqs {
+		reqs[i] = EnqueueRequest{Task: "email", Payload: i}
+	}
+	ids, err := New(backend).EnqueueBatch(t.Context(), reqs)
+	if err == nil {
+		t.Fatal("EnqueueBatch succeeded; want the third enqueue's error")
+	}
+	if len(ids) != 5 || ids[0] == "" || ids[1] == "" || ids[2] != "" || ids[3] != "" || ids[4] != "" {
+		t.Fatalf("ids = %q, want the first two set and the rest empty", ids)
+	}
+	if len(backend.ready) != 2 {
+		t.Errorf("stored %d jobs, want 2", len(backend.ready))
+	}
+}
+
+// failingEnqueuer fails the failAt-th Enqueue (1-based).
+type failingEnqueuer struct {
+	*fakeBackend
+	failAt, calls int
+}
+
+func (f *failingEnqueuer) Enqueue(ctx context.Context, job Job) (JobID, error) {
+	f.calls++
+	if f.calls == f.failAt {
+		return "", errors.New("connection reset")
+	}
+	return f.fakeBackend.Enqueue(ctx, job)
+}
+
+func TestEnqueueBatchFallsBackToSingleEnqueues(t *testing.T) {
+	backend := &fakeBackend{}
+	ids, err := New(backend).EnqueueBatch(t.Context(), []EnqueueRequest{
+		{Task: "email", Payload: 1},
+		{Task: "email", Payload: 2},
+		{Task: "image", Payload: 3},
+	})
+	if err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+	if len(ids) != 3 || len(backend.ready) != 3 || backend.ready[2].ID != ids[2] {
+		t.Fatalf("ids=%v ready=%d, want 3 jobs in order", ids, len(backend.ready))
+	}
+}

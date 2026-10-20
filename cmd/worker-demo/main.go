@@ -4,11 +4,14 @@ import (
 	"context"
 	"dist_tasks_go/examples/tasks"
 	"dist_tasks_go/internal/prettylog"
+	"dist_tasks_go/internal/telemetry"
 	"dist_tasks_go/prommetrics"
 	"dist_tasks_go/queue"
 	"dist_tasks_go/redisstream"
+	"flag"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,31 +22,50 @@ import (
 )
 
 func main() {
+	host, _ := os.Hostname()
+	// The random suffix keeps IDs unique even where PIDs repeat (PID 1 in every container).
+	id := flag.String("id", fmt.Sprintf("%s-%d-%04x", host, os.Getpid(), rand.IntN(1<<16)), "worker ID; must be unique per running worker")
+	metricsAddr := flag.String("metrics-addr", ":9090", "address for the /metrics endpoint (empty disables it)")
+	concurrency := flag.Int("concurrency", 4, "max jobs this worker runs at once")
+	visibility := flag.Duration("visibility", 30*time.Second, "how long a job's lease can go without a heartbeat before other workers recover it")
+	redisAddr := flag.String("redis", envOr("DTQ_REDIS_ADDR", "localhost:6379"), "Redis address")
+	flag.Parse()
+
 	slog.SetDefault(slog.New(prettylog.NewHandler(os.Stdout)))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	backend, err := redisstream.New(redisstream.Config{})
+	shutdownTracing, err := telemetry.Setup(ctx, "dtq-worker")
+	if err != nil {
+		slog.Error("tracing setup failed", "err", err)
+		os.Exit(1)
+	}
+	defer shutdownTracing(context.Background())
+
+	backend, err := redisstream.New(redisstream.Config{Addr: *redisAddr})
 	if err != nil {
 		slog.Error(err.Error())
+		os.Exit(1)
 	}
 
 	m := prommetrics.New(nil)
 
-	http.Handle("/metrics", promhttp.Handler())
-	go func() {
-		slog.Info("metrics listening on :9090/metrics")
-		if err := http.ListenAndServe(":9090", nil); err != nil {
-			slog.Error(fmt.Sprintf("metrics server: %v", err))
-		}
-	}()
+	if *metricsAddr != "" {
+		http.Handle("/metrics", promhttp.Handler())
+		go func() {
+			slog.Info("metrics listening", "addr", *metricsAddr)
+			if err := http.ListenAndServe(*metricsAddr, nil); err != nil {
+				slog.Error(fmt.Sprintf("metrics server: %v", err))
+			}
+		}()
+	}
 
 	worker := queue.NewWorker(backend, queue.WorkerConfig{
-		ID:                "worker-demo-1",
-		Concurrency:       4,
+		ID:                *id,
+		Concurrency:       *concurrency,
 		PollInterval:      250 * time.Millisecond,
-		VisibilityTimeout: 30 * time.Second,
+		VisibilityTimeout: *visibility,
 		RetryPolicy:       queue.DefaultRetryPolicy(),
 	}, m)
 
@@ -60,7 +82,15 @@ func main() {
 		slog.Error(err.Error())
 	}
 
+	slog.Info("worker started", "id", *id, "concurrency", *concurrency)
 	if err := worker.Run(ctx); err != nil && err != context.Canceled {
 		slog.Error(err.Error())
 	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
