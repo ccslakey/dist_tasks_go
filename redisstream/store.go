@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -167,13 +166,6 @@ func (b *Store) Enqueue(ctx context.Context, job queue.Job) (queue.JobID, error)
 // so either all of them are stored or none are. Jobs with idempotency keys
 // go through the same dedupe script as Enqueue.
 func (b *Store) EnqueueBatch(ctx context.Context, jobs []queue.Job) ([]queue.JobID, error) {
-	// Scripts run inside MULTI by SHA, so make sure Redis has this one. Only
-	// if it's needed: it costs a round trip, and on a cluster a broadcast.
-	if slices.ContainsFunc(jobs, func(j queue.Job) bool { return j.IdempotencyKey != "" }) {
-		if err := enqueueOnceScript.Load(ctx, b.rds).Err(); err != nil {
-			return nil, err
-		}
-	}
 	now := time.Now()
 	results := make([]*redis.Cmd, len(jobs))
 	_, err := b.rds.TxPipelined(ctx, func(p redis.Pipeliner) error {
@@ -182,24 +174,32 @@ func (b *Store) EnqueueBatch(ctx context.Context, jobs []queue.Job) ([]queue.Job
 			if job.ID == "" {
 				job.ID = queue.NewJobID()
 			}
-			data, err := json.Marshal(jobFields(*job))
-			if err != nil {
-				return err
-			}
+			fields := jobFields(*job)
 			var runAt int64
 			if job.AvailableAt.After(now) {
 				runAt = job.AvailableAt.UnixMilli()
 			}
+			if job.IdempotencyKey == "" && runAt == 0 {
+				p.XAdd(ctx, &redis.XAddArgs{Stream: b.config.Stream, Values: fields})
+				continue
+			}
+			// Keyed and delayed jobs store their fields as JSON.
+			data, err := json.Marshal(fields)
+			if err != nil {
+				return err
+			}
 			switch {
 			case job.IdempotencyKey != "":
-				results[i] = enqueueOnceScript.EvalSha(ctx, p,
+				// EVAL, not EVALSHA: Redis doesn't roll back the rest of an
+				// EXEC when one command fails, so a NOSCRIPT here (script
+				// cache flushed by a restart or failover) would commit the
+				// other jobs and break all-or-nothing.
+				results[i] = enqueueOnceScript.Eval(ctx, p,
 					[]string{b.config.DedupePrefix + job.IdempotencyKey, b.config.Stream, b.config.RetryKey, b.retryData},
 					string(job.ID), b.config.DedupeWindow.Milliseconds(), runAt, data)
-			case runAt > 0:
+			default:
 				p.HSet(ctx, b.retryData, string(job.ID), data)
 				p.ZAdd(ctx, b.config.RetryKey, redis.Z{Score: float64(runAt), Member: string(job.ID)})
-			default:
-				p.XAdd(ctx, &redis.XAddArgs{Stream: b.config.Stream, Values: jobFields(*job)})
 			}
 		}
 		return nil
@@ -579,29 +579,27 @@ func (b *Store) promoteRetries(ctx context.Context, limit int) (int, error) {
 		time.Now().UnixMilli(), limit).Int()
 }
 
+// Stats reads the queue's gauges in one pipelined round trip.
 func (b *Store) Stats(ctx context.Context) (queue.Stats, error) {
-
-	streamLen, err := b.rds.XLen(ctx, b.config.Stream).Result()
+	var (
+		streamLen, deadLen *redis.IntCmd
+		pend               *redis.XPendingCmd
+		retries            *redis.IntCmd
+	)
+	_, err := b.rds.Pipelined(ctx, func(p redis.Pipeliner) error {
+		streamLen = p.XLen(ctx, b.config.Stream)
+		pend = p.XPending(ctx, b.config.Stream, b.config.Group)
+		deadLen = p.XLen(ctx, b.config.DeadLetter)
+		retries = p.ZCard(ctx, b.config.RetryKey)
+		return nil
+	})
 	if err != nil {
 		return queue.Stats{}, err
 	}
-	pend, err := b.rds.XPending(ctx, b.config.Stream, b.config.Group).Result()
-	if err != nil {
-		return queue.Stats{}, err
-	}
-	deadLen, err := b.rds.XLen(ctx, b.config.DeadLetter).Result()
-	if err != nil {
-		return queue.Stats{}, err
-	}
-	retries, err := b.rds.ZCard(ctx, b.config.RetryKey).Result()
-	if err != nil {
-		return queue.Stats{}, err
-	}
-
 	return queue.Stats{
-		StreamLength:    streamLen,
-		InFlight:        pend.Count,
-		DeadLetterDepth: deadLen,
-		RetryScheduled:  retries,
+		StreamLength:    streamLen.Val(),
+		InFlight:        pend.Val().Count,
+		DeadLetterDepth: deadLen.Val(),
+		RetryScheduled:  retries.Val(),
 	}, nil
 }

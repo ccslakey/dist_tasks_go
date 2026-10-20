@@ -96,7 +96,7 @@ If blocking claims ever hang past their block time against a local Redis, check 
 - A crashed worker leaves jobs in the PEL (Pending Entries List); `RecoverExpired` (`XAUTOCLAIM`) re-delivers them once their lease has gone `VisibilityTimeout` without a heartbeat. Running jobs are heartbeated (`Extend`) so long jobs aren't stolen.
 - A worker whose lease was taken over (e.g. it was paused) can't settle the job: the fencing check rejects it, and its handler's context is cancelled with `ErrLeaseLost`.
 - On shutdown the worker stops claiming and lets in-flight jobs finish and settle (up to `ShutdownTimeout`); handlers run on a context detached from the shutdown signal.
-- Jobs delivered more than `MaxDeliveries` times without settling (poison messages) and jobs with no registered handler go to the DLQ.
+- Jobs delivered more than `MaxDeliveries` times without settling (poison messages) go to the DLQ. A worker with no handler for a job's task leaves it leased so recovery can give it to a worker that has one (rolling deploys), and dead-letters it at `MaxDeliveries`.
 - Retryable failures go to the retry sorted set with exponential backoff (`RetryPolicy.NextDelay`).
 - Permanent failures and exhausted jobs (`job.Exhausted()` → `ShouldDeadLetter`) go to the DLQ.
 - Handlers must be idempotent — a job may run more than once.

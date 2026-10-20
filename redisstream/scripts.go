@@ -9,36 +9,75 @@ import "github.com/redis/go-redis/v9"
 // a worker whose lease expired and was recovered can't settle or extend the
 // job afterwards, even if it later reuses the same consumer name.
 //
-// ARGV[1]=group ARGV[2]=message ID ARGV[3]=owner ARGV[4]=token
-const ownsLua = `
-local function owns(stream)
-  local p = redis.call('XPENDING', stream, ARGV[1], ARGV[2], ARGV[2], 1)
+// This is the only place the check is written; every fenced script, single
+// or batched, calls it.
+//
+// The single-delivery scripts below take ARGV[1]=group ARGV[2]=message ID
+// ARGV[3]=owner ARGV[4]=token.
+const leaseLua = `
+local function owns(stream, group, id, owner, token)
+  local p = redis.call('XPENDING', stream, group, id, id, 1)
   if #p == 0 then return false end
-  return p[1][2] == ARGV[3] and p[1][4] == tonumber(ARGV[4])
+  return p[1][2] == owner and p[1][4] == tonumber(token)
+end
+
+local function owns_argv(stream)
+  return owns(stream, ARGV[1], ARGV[2], ARGV[3], ARGV[4])
+end
+
+-- settle removes a delivered entry from the PEL and the stream. Deleting it
+-- keeps XLEN equal to the backlog instead of growing forever.
+local function settle(stream, group, id)
+  redis.call('XACK', stream, group, id)
+  redis.call('XDEL', stream, id)
+end
+
+-- renew resets a delivery's idle time without bumping its delivery count.
+local function renew(stream, group, id, owner)
+  redis.call('XCLAIM', stream, group, owner, 0, id, 'JUSTID')
+end
+
+-- each_owned runs action(id, owner) for every delivery in ARGV[2..] (message
+-- ID, owner, token triples; ARGV[1]=group) that the caller still owns, and
+-- returns one 1 (done) or 0 (lease lost) per delivery.
+local function each_owned(stream, action)
+  local out = {}
+  for i = 2, #ARGV, 3 do
+    if owns(stream, ARGV[1], ARGV[i], ARGV[i + 1], ARGV[i + 2]) then
+      action(ARGV[i], ARGV[i + 1])
+      out[#out + 1] = 1
+    else
+      out[#out + 1] = 0
+    end
+  end
+  return out
 end
 `
 
-// settle removes a delivered entry from the PEL and the stream. Deleting it
-// keeps XLEN equal to the backlog instead of growing forever.
-const settleLua = `
-local function settle(stream)
-  redis.call('XACK', stream, ARGV[1], ARGV[2])
-  redis.call('XDEL', stream, ARGV[2])
+// xaddJSONLua adds a stream entry from a job's fields stored as JSON (the
+// form the schedule hash and enqueue use).
+const xaddJSONLua = `
+local function xadd_json(stream, fields_json)
+  local fields = {}
+  for k, v in pairs(cjson.decode(fields_json)) do
+    fields[#fields + 1] = k
+    fields[#fields + 1] = v
+  end
+  redis.call('XADD', stream, '*', unpack(fields))
 end
 `
 
 // KEYS[1]=stream
-var ackScript = redis.NewScript(ownsLua + settleLua + `
-if not owns(KEYS[1]) then return 0 end
-settle(KEYS[1])
+var ackScript = redis.NewScript(leaseLua + `
+if not owns_argv(KEYS[1]) then return 0 end
+settle(KEYS[1], ARGV[1], ARGV[2])
 return 1
 `)
 
-// Resets the delivery's idle time without bumping its delivery count.
 // KEYS[1]=stream
-var extendScript = redis.NewScript(ownsLua + `
-if not owns(KEYS[1]) then return 0 end
-redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[3], 0, ARGV[2], 'JUSTID')
+var extendScript = redis.NewScript(leaseLua + `
+if not owns_argv(KEYS[1]) then return 0 end
+renew(KEYS[1], ARGV[1], ARGV[2], ARGV[3])
 return 1
 `)
 
@@ -46,38 +85,33 @@ return 1
 // step, so a crash can't leave it both scheduled and pending.
 // KEYS[1]=stream KEYS[2]=schedule zset KEYS[3]=schedule data hash
 // ARGV[5]=run-at (unix ms) ARGV[6]=job ID ARGV[7]=job fields as JSON
-var retryScript = redis.NewScript(ownsLua + settleLua + `
-if not owns(KEYS[1]) then return 0 end
+var retryScript = redis.NewScript(leaseLua + `
+if not owns_argv(KEYS[1]) then return 0 end
 redis.call('HSET', KEYS[3], ARGV[6], ARGV[7])
 redis.call('ZADD', KEYS[2], ARGV[5], ARGV[6])
-settle(KEYS[1])
+settle(KEYS[1], ARGV[1], ARGV[2])
 return 1
 `)
 
 // KEYS[1]=stream KEYS[2]=dead-letter stream
 // ARGV[5..]=field/value pairs for the dead-letter entry
-var deadLetterScript = redis.NewScript(ownsLua + settleLua + `
-if not owns(KEYS[1]) then return 0 end
+var deadLetterScript = redis.NewScript(leaseLua + `
+if not owns_argv(KEYS[1]) then return 0 end
 redis.call('XADD', KEYS[2], '*', unpack(ARGV, 5))
-settle(KEYS[1])
+settle(KEYS[1], ARGV[1], ARGV[2])
 return 1
 `)
 
 // Moves due entries from the schedule back onto the stream. Running inside a
 // script makes it one atomic step, so concurrent callers can't promote the
 // same job twice.
-const promoteLua = `
+const promoteLua = xaddJSONLua + `
 local function promote(zset, data, stream, now, limit)
   local ids = redis.call('ZRANGEBYSCORE', zset, '-inf', now, 'LIMIT', 0, limit)
   for _, id in ipairs(ids) do
     local fields_json = redis.call('HGET', data, id)
     if fields_json then
-      local fields = {}
-      for k, v in pairs(cjson.decode(fields_json)) do
-        fields[#fields + 1] = k
-        fields[#fields + 1] = v
-      end
-      redis.call('XADD', stream, '*', unpack(fields))
+      xadd_json(stream, fields_json)
     end
     redis.call('HDEL', data, id)
     redis.call('ZREM', zset, id)
@@ -161,7 +195,7 @@ return removed
 // KEYS[1]=dedupe key KEYS[2]=stream KEYS[3]=schedule zset KEYS[4]=schedule data hash
 // ARGV[1]=job ID ARGV[2]=dedupe window ms ARGV[3]=run-at unix ms (0 = now)
 // ARGV[4]=job fields as JSON
-var enqueueOnceScript = redis.NewScript(`
+var enqueueOnceScript = redis.NewScript(xaddJSONLua + `
 local existing = redis.call('GET', KEYS[1])
 if existing then return existing end
 redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
@@ -169,12 +203,7 @@ if tonumber(ARGV[3]) > 0 then
   redis.call('HSET', KEYS[4], ARGV[1], ARGV[4])
   redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1])
 else
-  local fields = {}
-  for k, v in pairs(cjson.decode(ARGV[4])) do
-    fields[#fields + 1] = k
-    fields[#fields + 1] = v
-  end
-  redis.call('XADD', KEYS[2], '*', unpack(fields))
+  xadd_json(KEYS[2], ARGV[4])
 end
 return ARGV[1]
 `)
@@ -182,34 +211,13 @@ return ARGV[1]
 // Acks a batch of deliveries in one round trip, each fenced like ackScript.
 // KEYS[1]=stream ARGV[1]=group, then ARGV[2..] = message ID, owner, token
 // triples. Returns one 1 (acked) or 0 (lease lost) per delivery.
-var ackBatchScript = redis.NewScript(`
-local out = {}
-for i = 2, #ARGV, 3 do
-  local p = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[i], ARGV[i], 1)
-  if #p > 0 and p[1][2] == ARGV[i + 1] and p[1][4] == tonumber(ARGV[i + 2]) then
-    redis.call('XACK', KEYS[1], ARGV[1], ARGV[i])
-    redis.call('XDEL', KEYS[1], ARGV[i])
-    out[#out + 1] = 1
-  else
-    out[#out + 1] = 0
-  end
-end
-return out
+var ackBatchScript = redis.NewScript(leaseLua + `
+return each_owned(KEYS[1], function(id) settle(KEYS[1], ARGV[1], id) end)
 `)
 
 // Renews a batch of leases in one round trip, each fenced like extendScript.
 // KEYS[1]=stream ARGV[1]=group, then ARGV[2..] = message ID, owner, token
 // triples. Returns one 1 (renewed) or 0 (lease lost) per delivery.
-var extendBatchScript = redis.NewScript(`
-local out = {}
-for i = 2, #ARGV, 3 do
-  local p = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[i], ARGV[i], 1)
-  if #p > 0 and p[1][2] == ARGV[i + 1] and p[1][4] == tonumber(ARGV[i + 2]) then
-    redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[i + 1], 0, ARGV[i], 'JUSTID')
-    out[#out + 1] = 1
-  else
-    out[#out + 1] = 0
-  end
-end
-return out
+var extendBatchScript = redis.NewScript(leaseLua + `
+return each_owned(KEYS[1], function(id, owner) renew(KEYS[1], ARGV[1], id, owner) end)
 `)

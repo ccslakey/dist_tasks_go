@@ -50,7 +50,8 @@ Every state transition (enqueue with an idempotency key, ack, retry, dead-letter
 | SIGTERM while jobs are running | Worker stops claiming, lets in-flight jobs finish and ack, then exits (cancels them after `ShutdownTimeout`) | Handlers run on a context detached from the shutdown signal | `TestWorkerShutdownDrainsAndAcksInFlightJobs` |
 | Redis blip | Worker backs off and keeps going instead of exiting | Exponential backoff in `Worker.Run` | `TestWorkerSurvivesTransientClaimErrors` |
 | Job crashes or hangs every worker that runs it (poison message) | Dead-lettered after `MaxDeliveries` deliveries | Delivery count | `TestWorkerDeadLettersPoisonMessage` |
-| No handler registered / malformed entry | Dead-lettered instead of stuck pending forever | `Worker.handleOne`, `Store.parseOrQuarantine` | `TestWorkerDeadLettersUnknownTask`, `TestMalformedEntryIsDeadLettered` |
+| No handler registered (e.g. mid rolling deploy) | Left leased, so recovery can hand it to a worker that has the handler; dead-lettered at `MaxDeliveries` instead of stuck forever | `Worker.handleOne` | `TestWorkerLeavesUnknownTaskForAnotherWorker` |
+| Malformed entry | Dead-lettered on first delivery, since it fails the same way everywhere | `Store.parseOrQuarantine` | `TestMalformedEntryIsDeadLettered` |
 
 ### Exactly-once effects
 

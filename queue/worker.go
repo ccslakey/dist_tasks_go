@@ -231,7 +231,9 @@ func (w *Worker) fetch(ctx context.Context, limit int, lastRecover *time.Time) (
 	if time.Since(*lastRecover) >= w.config.PollInterval {
 		recovered, err := w.backend.RecoverExpired(ctx, w.config.VisibilityTimeout, w.config.ID, limit)
 		if err != nil {
-			return nil, fmt.Errorf("recover expired: %w", err)
+			// A sharded backend can fail on one partition after leasing jobs
+			// from others. Those are ours now and must still run.
+			return recovered, fmt.Errorf("recover expired: %w", err)
 		}
 		if len(recovered) < limit {
 			*lastRecover = time.Now()
@@ -262,6 +264,9 @@ func (w *Worker) process(ctx context.Context, job Job) {
 	case errors.Is(err, ErrLeaseLost):
 		w.metrics.JobLeaseLost(ctx, job)
 		slog.Warn("lease lost; another worker owns this job now", "worker", w.config.ID, "job_id", job.ID, "task", job.Task)
+	case errors.Is(err, ErrUnknownTask):
+		slog.Warn("no handler for this task; leaving it for another worker after the visibility timeout",
+			"worker", w.config.ID, "job_id", job.ID, "task", job.Task, "delivery", job.Lease.Token)
 	default:
 		// The job is still leased to us and will be recovered after the
 		// visibility timeout.
@@ -282,7 +287,14 @@ func (w *Worker) handleOne(ctx context.Context, job Job) error {
 	}
 	handl, ok := w.handlers[job.Task]
 	if !ok {
-		return w.deadLetter(ctx, job, fmt.Sprintf("%v %q", ErrUnknownTask, job.Task))
+		if job.Lease.Token >= int64(w.config.MaxDeliveries) {
+			return w.deadLetter(ctx, job, fmt.Sprintf("%v %q after %d deliveries", ErrUnknownTask, job.Task, job.Lease.Token))
+		}
+		// Leave it leased. Once the lease expires, recovery hands it to some
+		// worker, which may have the handler (say, mid rolling deploy).
+		err := fmt.Errorf("%w %q", ErrUnknownTask, job.Task)
+		setOutcome(ctx, "skipped", err)
+		return err
 	}
 
 	w.metrics.JobStarted(ctx, job)

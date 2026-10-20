@@ -21,14 +21,30 @@ func TestWorkerRegisterRejectsInvalidHandlers(t *testing.T) {
 	}
 }
 
-func TestWorkerDeadLettersUnknownTask(t *testing.T) {
+// A worker without a handler leaves the job for another worker (one that may
+// have it, mid rolling deploy) and only dead-letters it at MaxDeliveries, so
+// it can't sit pending forever either.
+func TestWorkerLeavesUnknownTaskForAnotherWorker(t *testing.T) {
 	backend := &fakeBackend{}
-	worker := NewWorker(backend, WorkerConfig{ID: "worker-1"}, nil)
-	if err := worker.handleOne(t.Context(), testJob("job-1", "missing")); err != nil {
-		t.Fatalf("handleOne: %v", err)
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", MaxDeliveries: 3}, nil)
+
+	job := testJob("job-1", "missing")
+	for token := int64(1); token < 3; token++ {
+		job.Lease.Token = token
+		if err := worker.handleOne(t.Context(), job); !errors.Is(err, ErrUnknownTask) {
+			t.Fatalf("delivery %d: got %v, want ErrUnknownTask", token, err)
+		}
+		if len(backend.deadLettered()) != 0 || backend.ackedCount() != 0 {
+			t.Fatalf("delivery %d settled the job; it should be left for another worker", token)
+		}
+	}
+
+	job.Lease.Token = 3
+	if err := worker.handleOne(t.Context(), job); err != nil {
+		t.Fatalf("delivery 3: %v", err)
 	}
 	if _, ok := backend.deadLettered()["job-1"]; !ok {
-		t.Fatal("unknown task was not dead-lettered")
+		t.Fatal("unknown task not dead-lettered at MaxDeliveries")
 	}
 }
 
@@ -201,6 +217,24 @@ func TestWorkerShutdownDrainsAndAcksInFlightJobs(t *testing.T) {
 	}
 }
 
+// A sharded backend can lease jobs from some partitions and then fail on
+// another. The leased jobs must still run instead of waiting out another
+// visibility timeout.
+func TestWorkerRunsJobsRecoveredAlongsideAnError(t *testing.T) {
+	backend := &fakeBackend{
+		recoverable: []Job{testJob("job-1", "email"), testJob("job-2", "email")},
+		recoverErr:  errors.New("partition 3: connection refused"),
+	}
+	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", Concurrency: 4, PollInterval: time.Millisecond}, nil)
+	worker.Register("email", func(context.Context, Job) JobResult { return JobResult{} })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := runWorker(ctx, worker)
+	waitFor(t, func() bool { return backend.ackedCount() == 2 })
+	cancel()
+	<-done
+}
+
 func TestWorkerSurvivesTransientClaimErrors(t *testing.T) {
 	backend := &fakeBackend{ready: []Job{testJob("job-1", "email")}, claimErrs: 2}
 	worker := NewWorker(backend, WorkerConfig{ID: "worker-1", PollInterval: time.Millisecond}, nil)
@@ -283,6 +317,9 @@ type fakeBackend struct {
 	claimErrs int   // fail this many Claim calls before succeeding
 	extendErr error // returned by every Extend
 
+	recoverable []Job // returned once by RecoverExpired, along with recoverErr
+	recoverErr  error
+
 	acked   []Job
 	retried []Job
 	dead    map[JobID]string
@@ -316,7 +353,14 @@ func (f *fakeBackend) Claim(ctx context.Context, _ string, limit int, wait time.
 }
 
 func (f *fakeBackend) RecoverExpired(ctx context.Context, _ time.Duration, _ string, _ int) ([]Job, error) {
-	return nil, ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	jobs := f.recoverable
+	f.recoverable = nil
+	return jobs, f.recoverErr
 }
 
 func (f *fakeBackend) Extend(ctx context.Context, _ Job) error {
@@ -371,6 +415,40 @@ func (f *fakeBackend) deadLettered() map[JobID]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.dead
+}
+
+// When part of a batch fails, the caller must learn which jobs were stored
+// so a retry doesn't duplicate them.
+func TestEnqueueBatchReportsWhichJobsWereStored(t *testing.T) {
+	backend := &failingEnqueuer{fakeBackend: &fakeBackend{}, failAt: 3}
+	reqs := make([]EnqueueRequest, 5)
+	for i := range reqs {
+		reqs[i] = EnqueueRequest{Task: "email", Payload: i}
+	}
+	ids, err := New(backend).EnqueueBatch(t.Context(), reqs)
+	if err == nil {
+		t.Fatal("EnqueueBatch succeeded; want the third enqueue's error")
+	}
+	if len(ids) != 5 || ids[0] == "" || ids[1] == "" || ids[2] != "" || ids[3] != "" || ids[4] != "" {
+		t.Fatalf("ids = %q, want the first two set and the rest empty", ids)
+	}
+	if len(backend.ready) != 2 {
+		t.Errorf("stored %d jobs, want 2", len(backend.ready))
+	}
+}
+
+// failingEnqueuer fails the failAt-th Enqueue (1-based).
+type failingEnqueuer struct {
+	*fakeBackend
+	failAt, calls int
+}
+
+func (f *failingEnqueuer) Enqueue(ctx context.Context, job Job) (JobID, error) {
+	f.calls++
+	if f.calls == f.failAt {
+		return "", errors.New("connection reset")
+	}
+	return f.fakeBackend.Enqueue(ctx, job)
 }
 
 func TestEnqueueBatchFallsBackToSingleEnqueues(t *testing.T) {
