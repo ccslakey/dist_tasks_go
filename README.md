@@ -1,35 +1,67 @@
 # Distributed Task Queue in Go
 
-A distributed task queue on Redis Streams with worker pools, retries with exponential backoff, dead-lettering, lease-based crash recovery with heartbeats and fencing tokens, graceful shutdown, Prometheus metrics, and a fault-injection harness that checks the delivery guarantees hold while workers are killed and paused.
+A distributed task queue on Redis Streams with at-least-once delivery. It has worker pools, retries with exponential backoff and jitter, a dead-letter stream, lease-based crash recovery with heartbeats and fencing tokens, idempotent enqueue, graceful shutdown, hash-tagged partitions for Redis Cluster, Prometheus metrics, and OpenTelemetry tracing. A fault-injection harness checks that the delivery guarantees hold while worker processes are killed and paused under load.
 
-## Why Redis?
+## Quick Start
 
-A broker is the durable system between code that enqueues work and workers that execute work. Without a broker, jobs usually live only in process memory. With Redis Streams, workers can share jobs across processes, acknowledge successful work, recover jobs abandoned by dead workers, and preserve enough state to make retries and dead-letter queues real.
+```sh
+docker compose up -d --build     # Redis, 3 workers, a producer, Prometheus, Grafana, Jaeger
+open http://localhost:3000       # Grafana dashboard (no login)
+./scripts/kill-worker.sh         # SIGKILL a random worker mid-job; a replacement starts
+./scripts/kill-worker.sh -pause 10   # freeze one past its 5s lease so it comes back as a zombie
+open http://localhost:16686      # Jaeger: service dtq-worker, operation "process flaky_email"
+docker compose down
+```
 
-This repo uses Redis Streams for the production-style backend. You can add an in-memory backend later for tests or learning, but the Redis backend is what makes the resume project more convincing.
+The producer sends a mix of jobs at ~50/s: mostly successes, some that fail twice before succeeding, and a few that always fail. Kill a worker and you'll see its line drop out of "Jobs started per worker" while the others absorb its jobs. Freeze one and its stale results show up under "Leases lost" when it wakes. In Jaeger, one trace holds a job's enqueue and every attempt, across the producer and worker processes.
+
+If something already uses a port (say, a local Redis on 6379), override it: `REDIS_PORT=6380 docker compose up -d --build`. `PROMETHEUS_PORT`, `GRAFANA_PORT`, and `JAEGER_PORT` work the same way.
+
+![Grafana dashboard](docs/dashboard.png)
+
+**For a guided tour, see [docs/DEMO.md](docs/DEMO.md).** It walks through a job's life in Redis, crash recovery, zombie workers, graceful shutdown, the chaos test, and the benchmarks, with the commands to run and what to look for at each step.
 
 ## Architecture
 
 ```text
-enqueue-demo / application code
+application code (cmd/enqueue-demo)
         |
         v
-   queue.Queue
+   queue.Queue            marshals payloads, applies defaults, starts the trace
         |
         v
- queue.Backend interface
+ queue.Backend            interface: Enqueue, Claim, RecoverExpired, Extend,
+        |                 Ack, Retry, DeadLetter, Stats
+        v
+ redisstream.Store        one stream; every state change is a Lua script
+   or redisstream.Sharded N Stores with hash-tagged keys, for Redis Cluster (see Sharding)
         |
         v
- redisstream.Store            (one stream)
-   or redisstream.Sharded     (N partitions, each a Store; see Sharding)
-        |
-        v
- Redis Streams + retry schedule + dead-letter stream
- (one Redis, or a Redis Cluster for Sharded)
+ Redis Streams (main stream) + sorted set & hash (retry/delay schedule) + dead-letter stream
         ^
         |
- queue.Worker -> registered task handlers
+ queue.Worker             slot-bounded blocking claim loop, lease heartbeats,
+                          group-committed acks, graceful drain
 ```
+
+Redis Streams provide what a broker needs here: consumer groups to share jobs across processes, a Pending Entries List (PEL) that tracks which worker holds each job, and `XAUTOCLAIM` to take jobs back from workers that died.
+
+Default keys: the main stream `dtq:jobs` (settled entries are deleted, so `XLEN` is the backlog), consumer group `dtq:workers`, retry schedule `dtq:retry` (sorted set by run-at time) with job fields in `dtq:retry:jobs`, dead-letter stream `dtq:dead`, and idempotency keys `dtq:dedupe:<key>`.
+
+### Project layout
+
+| Path | What's there |
+|---|---|
+| [queue/](queue) | Backend-agnostic core: `Job`, `Lease`, `Queue`, `Worker`, retry policy, metrics interface, tracing |
+| [redisstream/](redisstream) | Redis backend: `Store`, `Sharded`, and every Lua script in [scripts.go](redisstream/scripts.go) |
+| [prommetrics/](prommetrics) | Prometheus adapter for `queue.Metrics` |
+| [examples/tasks/](examples/tasks) | Demo handlers: `send_email`, `process_image`, `flaky_email`, `permanent_fail` |
+| [cmd/enqueue-demo](cmd/enqueue-demo/main.go), [cmd/worker-demo](cmd/worker-demo/main.go) | Demo producer and worker |
+| [cmd/chaos](cmd/chaos/main.go) | Fault-injection test (see Chaos Testing) |
+| [cmd/bench](cmd/bench/main.go) | Throughput and pickup-latency benchmark (see Performance) |
+| [deploy/](deploy), [docker-compose.yml](docker-compose.yml) | Demo stack: Prometheus config and the Grafana dashboard |
+| [scripts/](scripts) | `kill-worker.sh` for the demo stack, `redis-cluster.sh` for a local 3-node cluster |
+| [internal/](internal) | Tracing setup, log formatting, test Redis helpers, shared `-redis`/`-partitions`/`-cluster` flags |
 
 ## Delivery Guarantees
 
@@ -154,41 +186,23 @@ Trade-offs:
 - **On one Redis it's slightly slower.** See the table above. Shard only when the queue will run on a cluster.
 - Use one `Sharded` per worker process, since buffered jobs are leased to the worker whose poll claimed them.
 
-Both tools take the same flags: `-partitions N` for a sharded queue on one Redis, and `-cluster seed,seed,...` for a Redis Cluster (16 partitions unless set). The chaos test passes with either.
+`cmd/chaos` and `cmd/bench` take the same flags: `-partitions N` for a sharded queue on one Redis, and `-cluster seed,seed,...` for a Redis Cluster (16 partitions unless set). The chaos test passes with either.
 
-## Live Demo
-
-```sh
-docker compose up -d --build     # Redis, 3 workers, a producer, Prometheus, Grafana, Jaeger
-open http://localhost:3000       # Grafana dashboard (no login)
-./scripts/kill-worker.sh         # SIGKILL a random worker mid-job; a replacement starts
-./scripts/kill-worker.sh -pause 10   # freeze one past its 5s lease so it comes back as a zombie
-open http://localhost:16686      # Jaeger: service dtq-worker, operation "process flaky_email"
-docker compose down
-```
-
-If something already uses a port (say, a local Redis on 6379), override it: `REDIS_PORT=6380 docker compose up -d --build`. `PROMETHEUS_PORT`, `GRAFANA_PORT`, and `JAEGER_PORT` work the same way.
-
-The producer sends a mix of jobs at ~50/s: mostly successes, some that fail twice before succeeding, and a few that always fail. Kill a worker and you'll see its line drop out of "Jobs started per worker" while the others absorb its jobs. Freeze one and its stale results show up under "Leases lost" when it wakes. In Jaeger, one trace holds a job's enqueue and every attempt, across the producer and worker processes.
-
-![Grafana dashboard](docs/dashboard.png)
-
-## Run Locally
-
-Start Redis:
+## Development
 
 ```sh
-docker compose up -d redis
+docker compose up -d redis       # Redis for the integration tests and demo commands
+go test ./...                    # integration tests skip if Redis isn't reachable
 ```
 
-Run tests:
+Integration tests use `TEST_REDIS_ADDR` (default `localhost:6379`) and run `FLUSHDB` when they finish, so don't point them at a Redis that `cmd/chaos`, `cmd/bench`, or the demo stack is using. To also run the sharded tests against a cluster:
 
 ```sh
-go test ./...
-TEST_REDIS_CLUSTER=127.0.0.1:30001,127.0.0.1:30002,127.0.0.1:30003 go test ./redisstream/ -run Sharded   # after scripts/redis-cluster.sh start
+scripts/redis-cluster.sh start
+TEST_REDIS_CLUSTER=127.0.0.1:30001,127.0.0.1:30002,127.0.0.1:30003 go test ./redisstream/ -run Sharded
 ```
 
-Run demos. Each worker needs its own metrics address (or `-metrics-addr ""`):
+To run the demo commands outside Docker, give each worker its own metrics address (or `-metrics-addr ""` to turn it off):
 
 ```sh
 go run ./cmd/enqueue-demo -n 50 -task flaky_email
@@ -196,6 +210,4 @@ go run ./cmd/worker-demo
 go run ./cmd/worker-demo -metrics-addr :9091
 ```
 
-## Resume Bullet Draft
-
-Built a distributed task queue in Go on Redis Streams with at-least-once delivery: lease-based recovery with heartbeats and fencing tokens, exactly-once side effects via idempotency keys, atomic Lua state transitions, batched claims and group-committed acks, and hash-tagged partitions for Redis Cluster (~95k jobs/s on one Redis and ~123k on a 3-node cluster, both on one laptop, with sub-millisecond p50 pickup). Verified with a fault-injection harness that SIGKILLs and pauses worker processes under load, which found and fixed bugs that lost ~3% of jobs.
+Both read `DTQ_REDIS_ADDR` (default `localhost:6379`) and export traces when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
