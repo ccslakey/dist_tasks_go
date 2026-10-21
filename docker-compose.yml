@@ -1,6 +1,7 @@
 # `docker compose up -d redis` starts just Redis (for tests and local runs).
 # `docker compose up -d --build` starts the whole demo: Redis, three workers,
-# a producer, Prometheus, Grafana, and Jaeger. See "Live Demo" in README.md.
+# a producer, Prometheus, Grafana, and Jaeger. See "Quick Start" in README.md
+# and docs/DEMO.md.
 services:
   redis:
     image: redis:7-alpine
